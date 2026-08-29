@@ -15,10 +15,179 @@ STATE_FILE = "seen_ids.json"
 
 # لیست علاقه‌مندی‌های شما (می‌توانید تغییر دهید)
 USER_INTERESTS = [
-    "امنیتی و هک و اکسپلویت",
-    "هوش مصنوعی و مدل‌های زبانی",
-    "اخبار لینوکس و سیستم‌عامل",
-    "برنامه‌نویسی و مهندسی معکوس"
+    # ─────────────────────────────────────
+    # Cybersecurity — Technical
+    # ─────────────────────────────────────
+
+    "امنیت سایبری",
+    "EDR و Endpoint Security",
+    "EDR Evasion و Bypass Techniques",
+    "مهندسی معکوس و Reverse Engineering",
+    "Binary Analysis و Binary Security",
+    "Exploit Development",
+    "Vulnerability Research",
+    "Fuzzing و Fuzzing Techniques",
+    "Rootkit",
+    "Bootkit",
+    "Firmware Security",
+    "UEFI و BIOS Security",
+    "Windows Internals",
+    "Windows Kernel Security",
+    "Windows Security Architecture",
+    "Windows امنیتی و سیاست‌های امنیتی مایکروسافت",
+    "Windows Code Integrity و Driver Security",
+    "PatchGuard و Kernel Protection",
+    "Malware Analysis",
+    "Advanced Malware Techniques",
+    "Threat Detection و Detection Engineering",
+    "Threat Intelligence",
+    "APT و Advanced Persistent Threats",
+    "Cyber Espionage",
+    "Cyber Warfare",
+
+    # ─────────────────────────────────────
+    # Computer Science
+    # ─────────────────────────────────────
+
+    "Computer Science",
+    "سیستم‌عامل‌ها و Operating Systems",
+    "سیستم‌های سطح پایین و Low-Level Systems",
+    "Compiler و Compiler Internals",
+    "Programming Languages",
+    "Computer Architecture",
+    "CPU و معماری پردازنده",
+    "Networking و Network Protocols",
+    "Distributed Systems",
+    "Systems Programming",
+    "Virtualization",
+    "Cloud Infrastructure",
+    "Database Internals",
+    "پروژه‌های جالب و غیرمعمول Computer Science",
+    "تحقیقات و ایده‌های جدید در علوم کامپیوتر",
+
+    # ─────────────────────────────────────
+    # Security Research & Conferences
+    # ─────────────────────────────────────
+
+    "کنفرانس‌های امنیت سایبری",
+    "مقالات و تحقیقات منتشرشده در کنفرانس‌های امنیتی",
+    "Black Hat",
+    "DEF CON",
+    "USENIX Security",
+    "NDSS",
+    "ACM CCS",
+    "IEEE Symposium on Security and Privacy",
+    "Black Hat Arsenal",
+    "Pwn2Own",
+    "CTF و تحقیقات امنیتی جالب",
+    "تحقیقات جدید Vulnerability Research",
+
+    # ─────────────────────────────────────
+    # Security Companies & Products
+    # ─────────────────────────────────────
+
+    "استارتاپ‌های امنیت سایبری",
+    "محصولات جدید Cybersecurity",
+    "محصولات EDR و XDR",
+    "محصولات Endpoint Security",
+    "محصولات Threat Intelligence",
+    "محصولات Detection و Security Operations",
+    "شرکت‌های فعال در Vulnerability Research",
+    "شرکت‌های فعال در Exploit Development",
+    "شرکت‌های فعال در Malware Analysis",
+    "سرمایه‌گذاری و Acquisition در Cybersecurity",
+    "معرفی محصولات و فناوری‌های امنیتی جدید",
+
+    # ─────────────────────────────────────
+    # Geopolitics & Strategic
+    # ─────────────────────────────────────
+
+    "اخبار راهبردی و استراتژیک",
+    "تحلیل‌های ژئوپلیتیک",
+    "امنیت ملی و National Security",
+    "جنگ سایبری و Cyber Warfare",
+    "Cyber Espionage",
+    "عملیات سایبری دولت‌ها",
+    "تحولات امنیتی بین‌المللی",
+    "رقابت فناوری بین قدرت‌های جهانی",
+    "جنگ فناوری و Technology Competition",
+
+    # ─────────────────────────────────────
+    # Iran
+    # ─────────────────────────────────────
+
+    "ایران",
+    "امنیت سایبری ایران",
+    "تحولات فناوری ایران",
+    "سیاست فناوری ایران",
+    "زیرساخت‌های حیاتی ایران",
+    "حملات سایبری مرتبط با ایران",
+    "گروه‌های تهدید ایرانی",
+    "تحولات سیاسی و راهبردی مرتبط با ایران",
+    "تحریم‌های فناوری علیه ایران",
+    "قوانین و مقررات فناوری ایران",
+
+    # ─────────────────────────────────────
+    # China
+    # ─────────────────────────────────────
+
+    "چین",
+    "فناوری چین",
+    "امنیت سایبری چین",
+    "صنعت فناوری چین",
+    "سیاست فناوری چین",
+    "شرکت‌های فناوری چینی",
+    "تحقیقات امنیتی چین",
+    "Cyber Operations مرتبط با چین",
+    "رقابت فناوری چین و آمریکا",
+    "قوانین و مقررات فناوری چین",
+
+    # ─────────────────────────────────────
+    # Middle East & Israel
+    # ─────────────────────────────────────
+
+    "خاورمیانه",
+    "امنیت سایبری خاورمیانه",
+    "تحولات راهبردی خاورمیانه",
+    "اسرائیل",
+    "امنیت سایبری اسرائیل",
+    "صنعت Cybersecurity اسرائیل",
+    "استارتاپ‌های امنیتی اسرائیل",
+    "عملیات سایبری اسرائیل",
+    "روابط ایران و اسرائیل",
+    "تحولات امنیتی منطقه",
+
+    # ─────────────────────────────────────
+    # United States & Regulation
+    # ─────────────────────────────────────
+
+    "آمریکا",
+    "قوانین فناوری آمریکا",
+    "قوانین امنیت سایبری آمریکا",
+    "Cybersecurity Regulation آمریکا",
+    "سیاست‌های فناوری آمریکا",
+    "سیاست‌های امنیت ملی آمریکا",
+    "CISA و سیاست‌های امنیت سایبری",
+    "مقررات صادرات فناوری",
+    "تحریم‌های فناوری و صادرات تراشه",
+    "قوانین مرتبط با AI و Cybersecurity",
+
+    # ─────────────────────────────────────
+    # Analytical / Interesting Content
+    # ─────────────────────────────────────
+
+    "مقالات تحلیلی و عمیق",
+    "تحلیل‌های فنی و Technical Deep Dive",
+    "تحلیل‌های راهبردی",
+    "تحلیل حملات سایبری",
+    "Post-Mortem حملات سایبری",
+    "مطالب Technical و Trick-Based",
+    "تکنیک‌های غیرمعمول و خلاقانه در امنیت",
+    "تحقیقات عجیب و جالب Computer Science",
+    "ایده‌های غیرمتعارف در فناوری",
+    "مقالات و پروژه‌های بسیار جالب",
+    "تحقیقات جدید و غیرمعمول",
+    "مطالبی که ایده یا تکنیک جدیدی معرفی می‌کنند",
 ]
 
 client = genai.Client(api_key=GEMINI_API_KEY)
