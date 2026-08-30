@@ -1,40 +1,32 @@
 name: RSS Aggregator Bot
 
 on:
-  schedule:
-    - cron: '0 */5 * * *'
   workflow_dispatch:
-
-permissions:
-  contents: write
+  schedule:
+    - cron: "*/30 * * * *"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v4.2.2
 
-      - name: Set up Python
-        uses: actions/setup-python@v5.3.0
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run RSS Bot
         env:
-          PYTHONUNBUFFERED: "1"
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python script.py
-
-      - name: Commit state
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add seen_ids.json || true
-          git commit -m "Update seen posts" || exit 0
-          git push
