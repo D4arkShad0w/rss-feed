@@ -3,7 +3,7 @@ name: RSS Aggregator Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"    # هر ۳۰ دقیقه
+    - cron: "0 * * * *"    # هر ۱ ساعت
 
 concurrency:
   group: rss-aggregator-bot
@@ -26,6 +26,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -44,11 +45,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add seen_ids.json || true
+
+          git add seen_ids.json
+
           if git diff --staged --quiet; then
             echo "No state changes to commit."
-          else
-            git commit -m "chore: update seen_ids state [skip ci]"
-            git pull --rebase --autostash origin "${{ github.ref_name }}"
-            git push
+            exit 0
           fi
+
+          git commit -m "chore: update seen_ids state [skip ci]"
+          git pull --rebase --autostash origin "${{ github.ref_name }}"
+          git push
