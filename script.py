@@ -1,8 +1,8 @@
 """
-RSS Security News Bot - Ultimate Edition
-========================================
+RSS Security News Bot - Ultimate Edition (Groq SDK)
+===================================================
 - Telegram reporting: Sends list of failed feeds directly to Telegram.
-- Groq first priority: Tries Groq first, falls back to Gemini.
+- Groq first priority: Uses official Groq SDK, falls back to Gemini.
 - Advanced fetch: Bypasses 403s (curl_cffi) and SSL errors (verify=False) automatically.
 """
 
@@ -35,8 +35,9 @@ requests.packages.urllib3.disable_warnings()
 from google import genai
 from google.genai import types
 
+# ✅ Groq SDK رسمی به‌جای OpenAI SDK
 try:
-    from openai import OpenAI
+    from groq import Groq
     GROQ_AVAILABLE = True
 except ImportError:
     GROQ_AVAILABLE = False
@@ -74,7 +75,8 @@ MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
 FUTURE_TOLERANCE = timedelta(hours=6)
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "40"))
+# ✅ تغییر سقف از 40 به 60
+MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "60"))
 
 FEED_TIMEOUT = 15
 ARTICLE_TIMEOUT = 20
@@ -96,21 +98,23 @@ USER_AGENT = (
 # MODEL CONFIGURATION
 # ============================================================
 
+# ✅ مدل‌های تأییدشده از اکانت شما
 # Groq first, Gemini fallback
 FILTER_MODELS = [
-    {"provider": "groq", "model": "llama-3.1-8b-instant"},
+    {"provider": "groq", "model": "openai/gpt-oss-20b"},        # سریع، تأییدشده
     {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-    {"provider": "groq", "model": "openai/gpt-oss-20b"},
+    {"provider": "groq", "model": "qwen/qwen3.6-27b"},          # تأییدشده
     {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
-    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+    {"provider": "groq", "model": "groq/compound-mini"},         # تأییدشده، سبک
 ]
 
 ANALYSIS_MODELS = [
-    {"provider": "groq", "model": "openai/gpt-oss-120b"},
+    {"provider": "groq", "model": "openai/gpt-oss-120b"},        # بهترین کیفیت، تأییدشده
     {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+    {"provider": "groq", "model": "qwen/qwen3.8-27b"},          # تأییدشده
     {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
-    {"provider": "groq", "model": "openai/gpt-oss-20b"},
+    {"provider": "groq", "model": "groq/compound"},             # تأییدشده، قدرتمند
+    {"provider": "groq", "model": "openai/gpt-oss-20b"},        # fallback
 ]
 
 
@@ -399,21 +403,22 @@ if GEMINI_API_KEY:
 else:
     logger.warning("GEMINI_API_KEY missing.")
 
+# ✅ استفاده رسمی از Groq SDK
 if GROQ_AVAILABLE and GROQ_API_KEY:
     try:
-        groq_client = OpenAI(
+        groq_client = Groq(
             api_key=GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
             http_client=httpx.Client(
                 transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=2),
                 timeout=30.0,
             ),
         )
-        logger.info("Groq initialized via OpenAI SDK (forced IPv4).")
+        logger.info("Groq initialized via official Groq SDK (forced IPv4).")
     except Exception as e:
         logger.error("Groq init failed: %s", e)
+        groq_client = None
 else:
-    logger.warning("GROQ_API_KEY missing or openai package not installed.")
+    logger.warning("GROQ_API_KEY missing or groq package not installed.")
 
 
 # ============================================================
@@ -695,7 +700,10 @@ def call_groq(model_name: str, prompt: str, max_tokens: int = 700) -> str:
     if not groq_client:
         raise RuntimeError("Groq client unavailable")
 
-    kwargs: Dict[str, Any] = {"max_completion_tokens": max(max_tokens, 512)}
+    # ✅ Groq SDK از max_tokens استفاده می‌کند (نه max_completion_tokens)
+    kwargs: Dict[str, Any] = {"max_tokens": max(max_tokens, 512)}
+
+    # فقط مدل‌های gpt-oss از reasoning_effort پشتیبانی می‌کنند
     if "gpt-oss" in model_name:
         kwargs["reasoning_effort"] = "low"
 
@@ -1032,6 +1040,7 @@ def main() -> None:
     logger.info("=" * 70)
 
     logger.info("Filter models: %s", [m["model"] for m in FILTER_MODELS])
+    logger.info("Analysis models: %s", [m["model"] for m in ANALYSIS_MODELS])
 
     logger.info("BOT_TOKEN: %s", "OK" if BOT_TOKEN else "MISSING")
     logger.info("CHAT_ID: %s", "OK" if CHAT_ID else "MISSING")
