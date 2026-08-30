@@ -1,11 +1,14 @@
 """
-RSS Security News Bot - Ultimate Edition (Groq SDK)
+RSS Security News Bot - Ultimate Edition (Final)
 ===================================================
 - Groq SDK رسمی بدون http_client سفارشی
 - .strip() روی همه‌ی API Keys
-- RSS Feed Discovery: وقتی سایت RSS ندارد، خودش RSS را پیدا می‌کند
-- Site Scraping: وقتی RSS پیدا نشد، خود سایت را scrape می‌کند
-- Duplicate Prevention: با URL normalization + title hash
+- 3-Layer HTTP: requests → curl_cffi → verify=False
+- Smart URL Variants: fix typos, RSSHub alternatives, WordPress ?format=xml
+- RSS Feed Discovery: پیدا کردن RSS در HTML <link>
+- Site Scraping: وقتی RSS نیست، خود سایت را scrap می‌کند
+- Triple Dedup: entry_id + normalized URL + title hash
+- Title Translation: ترجمه‌ی عنوان به فارسی با حفظ لغات تخصصی
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qs, urlencode
 
 import feedparser
 import listparser
@@ -29,14 +32,12 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Suppress warnings
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 requests.packages.urllib3.disable_warnings()
 
 from google import genai
 from google.genai import types
 
-# ✅ Groq SDK رسمی
 try:
     from groq import Groq
     GROQ_AVAILABLE = True
@@ -45,22 +46,15 @@ except ImportError:
 
 from curl_cffi import requests as cffi_requests
 
-# ============================================================
-# LOGGING
-# ============================================================
-
 import logging
-
 logging_format = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=logging_format, datefmt="%H:%M:%S")
 logger = logging.getLogger("rss_security_bot")
-
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-# ✅ .strip() روی همه‌ی کلیدها
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -71,28 +65,26 @@ STATE_FILE = "seen_ids.json"
 
 MAX_WORKERS = 20
 POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "50"))
-
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
 FUTURE_TOLERANCE = timedelta(hours=6)
-
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "60"))
 
-FEED_TIMEOUT = 15
-ARTICLE_TIMEOUT = 20
+FEED_TIMEOUT = 20
+ARTICLE_TIMEOUT = 25
 TELEGRAM_TIMEOUT = 10
-
 GEMINI_DELAY = 5.0
 MODEL_COOLDOWN_SECONDS = 1800
 TRANSIENT_COOLDOWN_SECONDS = 300
-
 TELEGRAM_MAX_LEN = 4096
+
+MAX_URL_VARIANTS = 15
+MAX_DISCOVERED_FEEDS = 8
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 )
-
 
 # ============================================================
 # MODEL CONFIGURATION
@@ -115,7 +107,6 @@ ANALYSIS_MODELS = [
     {"provider": "groq", "model": "openai/gpt-oss-20b"},
 ]
 
-
 # ============================================================
 # MODEL COOLDOWN
 # ============================================================
@@ -125,11 +116,9 @@ class NoModelsAvailable(RuntimeError):
 
 model_error_state: Dict[str, Tuple[float, int]] = {}
 
-
 def is_transient_error(reason: str) -> bool:
     r = reason.lower()
     return ("connection" in r or "429" in reason or "timeout" in r or "rate limit" in r)
-
 
 def cooldown_for(reason: str) -> int:
     if "Invalid filter" in reason or "Empty analysis" in reason:
@@ -138,7 +127,6 @@ def cooldown_for(reason: str) -> int:
         return TRANSIENT_COOLDOWN_SECONDS
     return MODEL_COOLDOWN_SECONDS
 
-
 def should_skip_model(model_key: str) -> bool:
     provider = model_key.split("/", 1)[0]
     for key in (model_key, f"__provider__/{provider}"):
@@ -146,7 +134,6 @@ def should_skip_model(model_key: str) -> bool:
         if entry and (time.time() - entry[0]) < entry[1]:
             return True
     return False
-
 
 def mark_model_error(model_key: str, reason: str = "") -> None:
     cooldown = cooldown_for(reason)
@@ -157,7 +144,6 @@ def mark_model_error(model_key: str, reason: str = "") -> None:
         provider = model_key.split("/", 1)[0]
         model_error_state[f"__provider__/{provider}"] = (time.time(), cooldown)
     logger.warning("[COOLDOWN] %s for %d min%s", model_key, cooldown // 60, f" — {reason[:300]}" if reason else "")
-
 
 # ============================================================
 # INTERESTS
@@ -188,15 +174,13 @@ INTEREST_CATEGORIES: Dict[str, List[str]] = {
     "DEEP TECHNICAL CONTENT": ["Technical Deep Dive", "Post-Mortem Attacks", "Root Cause Analysis", "Unusual Security Techniques", "Creative Systems Projects"],
 }
 
-
 def build_interests_prompt() -> str:
     return "\n".join(f"{cat}: {', '.join(ints)}" for cat, ints in INTEREST_CATEGORIES.items())
 
 INTERESTS_PROMPT = build_interests_prompt()
 
-
 # ============================================================
-# HTTP SESSION & ADVANCED FETCH
+# HTTP SESSION & ADVANCED FETCH (3-Layer)
 # ============================================================
 
 def build_session() -> requests.Session:
@@ -228,21 +212,21 @@ def is_safe_url(url: Optional[str]) -> bool:
 
 # ✅ URL Normalization برای جلوگیری از تکراری
 def normalize_url(url: str) -> str:
-    """Normalize URL — حذف tracking params، fragment، trailing slash."""
     try:
         parsed = urlparse(url)
         scheme = parsed.scheme or "https"
         netloc = parsed.netloc.lower().rstrip("/")
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
         path = parsed.path.rstrip("/")
         if not path:
             path = "/"
-        # حذف tracking parameters
         query = ""
         if parsed.query:
             params = []
             for param in parsed.query.split("&"):
                 key = param.split("=")[0].lower()
-                if not any(t in key for t in ["utm_", "fbclid", "gclid", "ref", "source", "campaign"]):
+                if not any(t in key for t in ["utm_", "fbclid", "gclid", "ref", "source", "campaign", "alt"]):
                     params.append(param)
             if params:
                 query = "?" + "&".join(params)
@@ -250,37 +234,45 @@ def normalize_url(url: str) -> str:
     except Exception:
         return url
 
-
+# ✅ 3-Layer fetch: requests → curl_cffi → verify=False
 def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
-    """Multi-Layer HTTP GET: requests → curl_cffi → verify=False."""
-    method = "requests"
+    # Layer 1: Standard requests
     try:
         response = HTTP.get(url, timeout=timeout, allow_redirects=True)
+        if response.status_code == 200:
+            return response
         if response.status_code in (403, 418, 503, 401):
             logger.info("  [HTTP] %d → curl_cffi for %s", response.status_code, url)
-            method = "curl_cffi"
-            response = cffi_requests.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True)
-        if response.status_code != 200:
-            logger.warning("[FETCH FAILED] %s | HTTP %d | %s", url, response.status_code, method)
-            return None
-        return response
+        else:
+            logger.warning("[FETCH] %s | HTTP %d | requests", url, response.status_code)
     except Exception as e:
         error_msg = str(e)
         if "SSL" in error_msg or "CERTIFICATE_VERIFY_FAILED" in error_msg:
-            logger.info("  [HTTP] SSL Error → verify=False for %s", url)
-            try:
-                response = HTTP.get(url, timeout=timeout, allow_redirects=True, verify=False)
-                if response.status_code != 200:
-                    logger.warning("[FETCH FAILED] %s | HTTP %d", url, response.status_code)
-                    return None
-                return response
-            except Exception as e2:
-                logger.warning("[FETCH ERROR] %s | %s", url, str(e2)[:100])
-                return None
+            logger.info("  [HTTP] SSL Error → will bypass for %s", url)
         else:
-            logger.warning("[FETCH ERROR] %s | %s | %s", url, error_msg[:100], method)
-            return None
+            logger.info("  [HTTP] requests failed: %s | %s", url, error_msg[:100])
 
+    # Layer 2: curl_cffi — برای همه‌ی خطاها
+    try:
+        response = cffi_requests.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True)
+        if response.status_code == 200:
+            logger.info("  [HTTP] ✅ curl_cffi succeeded: %s", url)
+            return response
+        logger.warning("[FETCH] %s | HTTP %d | curl_cffi", url, response.status_code)
+    except Exception as e:
+        logger.info("  [HTTP] curl_cffi failed: %s | %s", url, str(e)[:100])
+
+    # Layer 3: verify=False (SSL bypass)
+    try:
+        response = HTTP.get(url, timeout=timeout, allow_redirects=True, verify=False)
+        if response.status_code == 200:
+            logger.info("  [HTTP] ✅ verify=False succeeded: %s", url)
+            return response
+        logger.warning("[FETCH] %s | HTTP %d | verify=False", url, response.status_code)
+    except Exception as e:
+        logger.warning("[FETCH] %s | ALL methods failed | %s", url, str(e)[:100])
+
+    return None
 
 # ============================================================
 # CLIENT INITIALIZATION
@@ -298,7 +290,6 @@ if GEMINI_API_KEY:
 else:
     logger.warning("GEMINI_API_KEY missing.")
 
-# ✅ Groq SDK رسمی — بدون http_client سفارشی
 if GROQ_AVAILABLE and GROQ_API_KEY:
     try:
         groq_client = Groq(api_key=GROQ_API_KEY)
@@ -309,9 +300,8 @@ if GROQ_AVAILABLE and GROQ_API_KEY:
 else:
     logger.warning("GROQ_API_KEY missing or groq package not installed.")
 
-
 # ============================================================
-# STATE (با seen_urls و seen_titles)
+# STATE
 # ============================================================
 
 def load_state() -> Tuple[Set[str], Dict[str, int], Set[str], Set[str]]:
@@ -331,7 +321,6 @@ def load_state() -> Tuple[Set[str], Dict[str, int], Set[str], Set[str]]:
         logger.error("State load error: %s", e)
     return set(), {}, set(), set()
 
-
 def save_state(seen_ids: Set[str], retry_counts: Dict[str, int],
                seen_urls: Set[str], seen_titles: Set[str]) -> None:
     try:
@@ -348,7 +337,6 @@ def save_state(seen_ids: Set[str], retry_counts: Dict[str, int],
     except Exception as e:
         logger.error("State save error: %s", e)
 
-
 # ============================================================
 # TEXT CLEANING
 # ============================================================
@@ -364,12 +352,10 @@ def clean_html(text: Any) -> str:
     except Exception:
         return str(text).strip()
 
-
 def escape_html_text(text: Any) -> str:
     if not text:
         return ""
     return html.escape(str(text), quote=False)
-
 
 # ============================================================
 # TELEGRAM
@@ -388,13 +374,11 @@ def _post_telegram(payload: Dict[str, Any]) -> bool:
         logger.error("Telegram exception: %s", e)
     return False
 
-
 def send_status_message(text: str) -> bool:
     if len(text) > 4000:
         text = text[:4000] + "\n... (Truncated)"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_notification": True}
     return _post_telegram(payload)
-
 
 def send_telegram(title: str, analysis: str, link: str, category: str, source: str = "") -> bool:
     if not BOT_TOKEN or not CHAT_ID:
@@ -423,12 +407,78 @@ def send_telegram(title: str, analysis: str, link: str, category: str, source: s
         logger.info("Telegram message sent.")
     return ok
 
+# ============================================================
+# SMART URL VARIANTS — اصلاح هوشمند URL
+# ============================================================
+
+# ✅ تولید URL های جایگزین وقتی URL اصلی fail می‌شود
+def generate_url_variants(url: str) -> List[str]:
+    """Generate URL variants to try when the original fails."""
+    variants: List[str] = []
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+
+    # 1. Fix common typos
+    if "sympoium" in url:
+        variants.append(url.replace("sympoium", "symposium"))
+    if "sympozium" in url:
+        variants.append(url.replace("sympozium", "symposium"))
+
+    # 2. RSSHub alternative instances
+    if "rsshub.app" in url:
+        for alt in ["rsshub.rssforever.com", "rss.shab.fun", "rsshub.feeded.xyz"]:
+            variants.append(url.replace("rsshub.app", alt))
+
+    # 3. WordPress ?format=xml
+    if "wordpress.com" in parsed.netloc:
+        sep = "&" if "?" in url else "?"
+        variants.append(url + sep + "format=xml")
+
+    # 4. Remove ?alt=rss
+    if "alt=rss" in url:
+        cleaned = url.replace("?alt=rss", "").replace("&alt=rss", "").replace("?&", "?").rstrip("?")
+        variants.append(cleaned)
+
+    # 5. Add /feed/ if not present
+    if not path.endswith("/feed") and not path.endswith("/feed/"):
+        if not path.endswith(".xml") and not path.endswith(".rss"):
+            variants.append(base + path + "/feed/")
+
+    # 6. Common RSS paths (for homepages)
+    if path in ["", "/", "/index.php", "/index.html", "/blog"]:
+        for p in ["/feed", "/feed/", "/rss", "/rss.xml", "/atom.xml",
+                  "/feeds/posts/default", "/index.xml", "/feed.xml",
+                  "/blog/feed", "/news/rss", "/?feed=rss2", "/?feed=atom"]:
+            variants.append(base + p)
+
+    # 7. Try http:// instead of https:// (SSL workaround)
+    if parsed.scheme == "https":
+        variants.append(url.replace("https://", "http://", 1))
+
+    # 8. Try with www. if not present
+    if not parsed.netloc.startswith("www."):
+        variants.append(url.replace(f"://{parsed.netloc}", f"://www.{parsed.netloc}", 1))
+
+    # 9. Try without www. if present
+    if parsed.netloc.startswith("www."):
+        variants.append(url.replace("://www.", "://", 1))
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for v in variants:
+        nv = normalize_url(v)
+        if nv not in seen and nv != normalize_url(url):
+            seen.add(nv)
+            unique.append(v)
+
+    return unique[:MAX_URL_VARIANTS]
 
 # ============================================================
 # RSS FEED DISCOVERY + SITE SCRAPING
 # ============================================================
 
-# ✅ وقتی سایت RSS ندارد، RSS را در HTML پیدا کن
 def discover_rss_feeds(html_text: str, base_url: str) -> List[str]:
     """Find RSS feed links in HTML <link> tags + try common paths."""
     feeds = []
@@ -444,39 +494,43 @@ def discover_rss_feeds(html_text: str, base_url: str) -> List[str]:
                 elif not href.startswith("http"):
                     href = urljoin(base_url, href)
                 feeds.append(href)
-
+        # Also try <a> tags with "rss" or "feed" in href
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if "rss" in href.lower() or "feed" in href.lower() or "atom" in href.lower():
+                if href.startswith("/"):
+                    parsed = urlparse(base_url)
+                    href = f"{parsed.scheme}://{parsed.netloc}{href}"
+                elif not href.startswith("http"):
+                    href = urljoin(base_url, href)
+                if is_safe_url(href):
+                    feeds.append(href)
         # Common RSS paths
         parsed = urlparse(base_url)
-        base = f"{parsed.scheme}://{parsed.netloc}"
+        b = f"{parsed.scheme}://{parsed.netloc}"
         for path in ["/feed", "/rss", "/rss.xml", "/atom.xml",
                       "/feeds/posts/default", "/index.xml", "/feed.xml",
-                      "/blog/feed", "/news/rss"]:
-            feeds.append(f"{base}{path}")
+                      "/blog/feed", "/news/rss", "/feed/", "/rss/"]:
+            feeds.append(f"{b}{path}")
     except Exception:
         pass
-    return feeds
+    return feeds[:MAX_DISCOVERED_FEEDS]
 
-
-# ✅ وقتی RSS پیدا نشد، خود سایت را scrape کن
 def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
     """Scrape article links from a website when no RSS is available."""
     entries = []
     try:
         soup = BeautifulSoup(html_text, "html.parser")
         seen_links: Set[str] = set()
-
-        # Article link selectors — الگوهای رایج
         selectors = [
-            "article h2 a", "article h3 a", "article h1 a",
-            "article a[href]", ".post-title a", ".entry-title a",
-            ".article-title a", "h2.title a", "h3.title a",
-            ".post h2 a", ".post h3 a", ".entry h2 a", ".entry h3 a",
-            ".blog-post h2 a", ".blog-post h3 a",
-            ".news-item h3 a", ".news-item h2 a",
-            ".card-title a", ".card a[href]",
-            "main h2 a", "main h3 a",
+            "article h2 a", "article h3 a", "article h1 a", "article a[href]",
+            ".post-title a", ".entry-title a", ".article-title a",
+            "h2.title a", "h3.title a", ".post h2 a", ".post h3 a",
+            ".entry h2 a", ".entry h3 a", ".blog-post h2 a", ".blog-post h3 a",
+            ".news-item h3 a", ".news-item h2 a", ".card-title a",
+            "main h2 a", "main h3 a", ".list-item a", ".item-title a",
+            ".post-list a[href]", ".article-list a[href]",
         ]
-
         for selector in selectors:
             try:
                 for link in soup.select(selector):
@@ -484,7 +538,6 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
                     title = clean_html(link.get_text(" ", strip=True))
                     if not href or not title or len(title) < 10:
                         continue
-                    # Make absolute URL
                     if href.startswith("/"):
                         parsed = urlparse(base_url)
                         href = f"{parsed.scheme}://{parsed.netloc}{href}"
@@ -493,36 +546,29 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
                     href = normalize_url(href)
                     if href in seen_links or not is_safe_url(href):
                         continue
-                    # Skip navigation/social links
-                    skip_patterns = ["facebook.com", "twitter.com", "linkedin.com",
-                                    "instagram.com", "youtube.com", "#", "mailto:",
-                                    "javascript:", "tel:"]
-                    if any(p in href.lower() for p in skip_patterns):
+                    skip = ["facebook.com", "twitter.com", "linkedin.com",
+                            "instagram.com", "youtube.com", "#", "mailto:",
+                            "javascript:", "tel:", "share", "comment"]
+                    if any(p in href.lower() for p in skip):
                         continue
                     seen_links.add(href)
                     entries.append({
-                        "title": title,
-                        "link": href,
-                        "summary": "",
-                        "description": "",
-                        "id": href,
-                        "published_parsed": None,
-                        "updated_parsed": None,
+                        "title": title, "link": href, "summary": "",
+                        "description": "", "id": href,
+                        "published_parsed": None, "updated_parsed": None,
                     })
             except Exception:
                 pass
-
-        # اگر با selector چیزی پیدا نشد، همه‌ی لینک‌ها را بررسی کن
         if not entries:
             for link in soup.find_all("a", href=True):
                 href = link.get("href", "")
                 title = clean_html(link.get_text(" ", strip=True))
                 if not href or not title or len(title) < 20:
                     continue
-                # فقط لینک‌هایی که شبیه مقاله هستند
                 if not any(kw in href.lower() for kw in
                            ["/post/", "/article/", "/blog/", "/news/",
-                            "/2024/", "/2025/", "/2023/", "/p/", "/entry/"]):
+                            "/2020/", "/2021/", "/2022/", "/2023/",
+                            "/2024/", "/2025/", "/p/", "/entry/"]):
                     continue
                 if href.startswith("/"):
                     parsed = urlparse(base_url)
@@ -532,29 +578,24 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
                 href = normalize_url(href)
                 if href in seen_links or not is_safe_url(href):
                     continue
-                skip_patterns = ["facebook.com", "twitter.com", "linkedin.com",
-                                "instagram.com", "youtube.com", "#", "mailto:"]
-                if any(p in href.lower() for p in skip_patterns):
+                skip = ["facebook.com", "twitter.com", "linkedin.com",
+                        "instagram.com", "youtube.com", "#", "mailto:"]
+                if any(p in href.lower() for p in skip):
                     continue
                 seen_links.add(href)
                 entries.append({
-                    "title": title,
-                    "link": href,
-                    "summary": "",
-                    "description": "",
-                    "id": href,
-                    "published_parsed": None,
-                    "updated_parsed": None,
+                    "title": title, "link": href, "summary": "",
+                    "description": "", "id": href,
+                    "published_parsed": None, "updated_parsed": None,
                 })
-
-        logger.info("  [SCRAPE] Found %d articles from %s", len(entries), base_url)
+        if entries:
+            logger.info("  [SCRAPE] Found %d articles from %s", len(entries), base_url)
     except Exception as e:
         logger.warning("Site scrape error: %s", e)
     return entries
 
-
 # ============================================================
-# FEED & ARTICLE FETCH
+# FEED FETCH — با Smart URL Variants + RSS Discovery + Scraping
 # ============================================================
 
 ARTICLE_SELECTORS = [
@@ -563,46 +604,63 @@ ARTICLE_SELECTORS = [
 ]
 STRIP_TAGS = ["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]
 
-# ✅ fetch_single_feed — با RSS Discovery و Site Scraping
+# ✅ تلاش برای یک URL — fetch + parse + discovery + scrape
+def try_fetch_feed_url(url: str) -> List[Any]:
+    """Try to fetch and parse a feed URL with RSS discovery and scraping."""
+    response = fetch_url(url, FEED_TIMEOUT)
+    if not response:
+        return []
+
+    # مرحله 1: feedparser
+    parsed = feedparser.parse(response.content)
+    if parsed.entries:
+        return parsed.entries[:POSTS_PER_FEED]
+
+    # مرحله 2: RSS Discovery
+    discovered = discover_rss_feeds(response.text, url)
+    for rss_url in discovered:
+        if normalize_url(rss_url) == normalize_url(url):
+            continue
+        rss_response = fetch_url(rss_url, FEED_TIMEOUT)
+        if rss_response:
+            rss_parsed = feedparser.parse(rss_response.content)
+            if rss_parsed.entries:
+                logger.info("  [DISCOVERY] ✅ Found RSS: %s (%d entries)", rss_url, len(rss_parsed.entries))
+                return rss_parsed.entries[:POSTS_PER_FEED]
+
+    # مرحله 3: Site Scraping
+    scraped = scrape_site_articles(response.text, url)
+    if scraped:
+        return scraped[:POSTS_PER_FEED]
+
+    return []
+
+# ✅ fetch_single_feed — اصلی‌ترین تابع با Smart Variants
 def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
     feed_url = feed.get("url") if isinstance(feed, dict) else getattr(feed, "url", None)
     if not feed_url or not is_safe_url(feed_url):
         return [], False
     try:
-        response = fetch_url(feed_url, FEED_TIMEOUT)
-        if not response:
-            return [], False
+        # مرحله 1: URL اصلی
+        entries = try_fetch_feed_url(feed_url)
+        if entries:
+            return entries, True
 
-        # مرحله 1: تلاش با feedparser
-        parsed = feedparser.parse(response.content)
-        if parsed.entries:
-            return parsed.entries[:POSTS_PER_FEED], True
+        # مرحله 2: URL Variants (اصلاح هوشمند)
+        variants = generate_url_variants(feed_url)
+        if variants:
+            logger.info("  [FEED] Original failed, trying %d variants for %s", len(variants), feed_url)
 
-        # ✅ مرحله 2: RSS Discovery — پیدا کردن RSS در HTML
-        logger.info("  [FEED] No RSS entries, trying discovery for %s", feed_url)
-        discovered = discover_rss_feeds(response.text, feed_url)
-        for rss_url in discovered:
-            if rss_url == normalize_url(feed_url):
-                continue
-            logger.info("  [DISCOVERY] Trying: %s", rss_url)
-            rss_response = fetch_url(rss_url, FEED_TIMEOUT)
-            if rss_response:
-                rss_parsed = feedparser.parse(rss_response.content)
-                if rss_parsed.entries:
-                    logger.info("  [DISCOVERY] ✅ Found RSS: %s (%d entries)", rss_url, len(rss_parsed.entries))
-                    return rss_parsed.entries[:POSTS_PER_FEED], True
-
-        # ✅ مرحله 3: Site Scraping — scrap کردن خود سایت
-        logger.info("  [DISCOVERY] No RSS found, scraping site: %s", feed_url)
-        scraped = scrape_site_articles(response.text, feed_url)
-        if scraped:
-            return scraped[:POSTS_PER_FEED], True
+        for variant_url in variants:
+            entries = try_fetch_feed_url(variant_url)
+            if entries:
+                logger.info("  [FEED] ✅ Variant succeeded: %s", variant_url)
+                return entries, True
 
         return [], False
     except Exception as e:
         logger.warning("Feed error %s: %s", feed_url, e)
         return [], False
-
 
 def fetch_raw_html(url: str) -> Optional[str]:
     if not url or not is_safe_url(url):
@@ -615,7 +673,6 @@ def fetch_raw_html(url: str) -> Optional[str]:
     except Exception as e:
         logger.warning("Article fetch error for %s: %s", url, e)
         return None
-
 
 def extract_article_text(raw_html: Optional[str]) -> Optional[str]:
     if not raw_html:
@@ -647,9 +704,8 @@ def extract_article_text(raw_html: Optional[str]) -> Optional[str]:
         logger.warning("Article parse error: %s", e)
         return None
 
-
 # ============================================================
-# SOURCE / WECHAT LINK EXTRACTION
+# SOURCE / WECHAT
 # ============================================================
 
 def detect_source(entry: Any) -> str:
@@ -668,12 +724,10 @@ def extract_original_link(fallback_url: str, *html_sources: Optional[str]) -> st
             return html.unescape(match.group(0)).rstrip(".,);]")
     return fallback_url
 
-
 # ============================================================
 # ENTRY ID & DATE
 # ============================================================
 
-# ✅ URL normalization در get_entry_id برای جلوگیری از تکراری
 def get_entry_id(entry: Any) -> Optional[str]:
     value = entry.get("id") or entry.get("guid") or entry.get("link")
     if value:
@@ -685,11 +739,9 @@ def get_entry_id(entry: Any) -> Optional[str]:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return None
 
-# ✅ برای مقالات scrape‌شده بدون تاریخ، recent فرض کن
 def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
-        # مقالات scrape‌شده تاریخ ندارند — recent فرض کن
         return True
     try:
         date = datetime(*parsed[:6], tzinfo=timezone.utc)
@@ -701,7 +753,6 @@ def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
 def entry_sort_key(entry: Any) -> datetime:
     p = entry.get("published_parsed") or entry.get("updated_parsed")
     return datetime(*p[:6], tzinfo=timezone.utc) if p else datetime.min.replace(tzinfo=timezone.utc)
-
 
 # ============================================================
 # GROQ / GEMINI CALLS
@@ -729,7 +780,6 @@ def call_groq(model_name: str, prompt: str, max_tokens: int = 700) -> str:
         raise RuntimeError("Empty Groq content")
     return content.strip()
 
-
 def call_gemini(model_name: str, prompt: str, max_tokens: int = 700) -> str:
     if not gemini_client:
         raise RuntimeError("Gemini client unavailable")
@@ -756,9 +806,8 @@ def call_model(provider: str, model: str, prompt: str, max_tokens: int = 700) ->
         return call_gemini(model, prompt, max_tokens)
     raise RuntimeError(f"Unknown provider: {provider}")
 
-
 # ============================================================
-# FILTER & ANALYSIS LOGIC
+# FILTER & ANALYSIS LOGIC (با Title Translation)
 # ============================================================
 
 def build_filter_prompt(title: str, summary: str, source: str = "") -> str:
@@ -782,20 +831,10 @@ SOURCE:
 
 فقط مشخص کن که خبر برای این کاربر ارزش پیگیری دارد یا نه.
 
-RELEVANT:
-اگر ارتباط واقعی و معنادار با یکی از حوزه‌های بالا دارد.
+RELEVANT: اگر ارتباط واقعی و معنادار با یکی از حوزه‌های بالا دارد.
+REJECT: اگر عمومی، بی‌ربط، تبلیغاتی یا کم‌ارزش است.
 
-REJECT:
-اگر عمومی، بی‌ربط، تبلیغاتی یا کم‌ارزش است.
-
-فقط یکی از این دو کلمه را خروجی بده:
-
-RELEVANT
-
-یا
-
-REJECT
-
+فقط یکی از این دو کلمه را خروجی بده: RELEVANT یا REJECT
 هیچ توضیح دیگری ننویس.
 """
 
@@ -838,7 +877,7 @@ def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
         raise NoModelsAvailable("No models available for filtering")
     return None
 
-
+# ✅ Analysis Prompt با Title Translation
 def build_analysis_prompt(title: str, article_text: str, link: str, source: str) -> str:
     if len(article_text) > 18000:
         article_text = article_text[:18000]
@@ -847,8 +886,22 @@ def build_analysis_prompt(title: str, article_text: str, link: str, source: str)
 
 مطلب زیر قبلاً توسط فیلتر تایید شده است.
 
-وظیفه: به زبان فارسی توضیح بده که این مطلب دقیقاً درباره چیست و چه نکات مهمی دارد.
-خروجی باید حدود 10 تا 15 خط باشد.
+وظایف:
+
+۱. ابتدا عنوان این مطلب را به فارسی ترجمه کن.
+   - لغات تخصصی امنیتی و کامپیوتری (مانند EDR, APT, CVE, RCE, XSS, Buffer Overflow, Use-After-Free, Kernel, UEFI, Rootkit, PatchGuard, PPL, VBS, AMSI) را به انگلیسی نگه دار.
+   - نام‌های خاص (مانند Black Hat, DEF CON, Windows, Linux, Google, Microsoft, Intel, AMD) را به انگلیسی نگه دار.
+   - برای اصطلاحات عمومی معادل فارسی استفاده کن.
+
+۲. سپس تحلیل ۱۰ تا ۱۵ خطی فارسی بنویس.
+
+فرمت دقیق خروجی:
+
+TITLE_FA: [عنوان ترجمه‌شده به فارسی]
+
+---
+
+[تحلیل فارسی]
 
 در تحلیل این موارد را پوشش بده:
 - موضوع اصلی مطلب
@@ -867,10 +920,10 @@ def build_analysis_prompt(title: str, article_text: str, link: str, source: str)
 1. چیزی را که در متن نیست اختراع نکن.
 2. اطلاعات عمومی خودت را به جای محتوای مقاله قرار نده.
 3. اگر متن ناقص است، صریحاً بگو.
-4. عنوان را دوباره کپی نکن.
+4. عنوان انگلیسی را دوباره کپی نکن — فقط نسخه‌ی ترجمه‌شده بده.
 5. از bulletهای خیلی کوتاه استفاده نکن؛ متن باید خوانا و تحلیلی باشد.
-6. خروجی فقط تحلیل فارسی باشد.
-7. حدود 10 تا 15 خط بنویس.
+6. خروجی فقط فارسی باشد (به جز لغات تخصصی انگلیسی).
+7. حدود ۱۰ تا ۱۵ خط بنویس.
 
 TITLE:
 {title}
@@ -885,7 +938,33 @@ ARTICLE:
 {article_text}
 """
 
-def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optional[str]:
+# ✅ استخراج عنوان ترجمه‌شده و تحلیل از پاسخ AI
+def parse_analysis_response(response: str) -> Tuple[str, str]:
+    """Extract translated title and analysis from AI response."""
+    title_fa = ""
+    analysis = response.strip()
+
+    # تلاش برای استخراج TITLE_FA
+    match = re.search(r'TITLE_FA:\s*(.+?)(?:\n---|\n\n|\nANALYSIS:)', response, re.DOTALL | re.IGNORECASE)
+    if match:
+        title_fa = match.group(1).strip()
+        remaining = response[match.end():].strip()
+        # حذف جداکننده‌های ابتدایی
+        analysis = re.sub(r'^[-=*\s\n]+', '', remaining).strip()
+        # حذف "ANALYSIS:" اگر وجود داشت
+        analysis = re.sub(r'^ANALYSIS:\s*', '', analysis, flags=re.IGNORECASE).strip()
+    else:
+        # اگر فرمت رعایت نشد، خط اول را title فرض کن
+        lines = response.strip().split('\n')
+        if lines and not lines[0].startswith('TITLE_FA'):
+            # کل response را به‌عنوان analysis بگذار
+            pass
+
+    return title_fa, analysis
+
+# ✅ deep_analyze حالا (title_fa, analysis) برمی‌گرداند
+def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optional[Tuple[str, str]]:
+    """Returns (title_fa, analysis) or None."""
     prompt = build_analysis_prompt(title, article_text, link, source)
     attempted_any = False
     for item in ANALYSIS_MODELS:
@@ -896,11 +975,17 @@ def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optio
         attempted_any = True
         try:
             logger.info("  [ANALYSIS] trying %s", key)
-            result = call_model(provider, model, prompt, max_tokens=1200)
+            result = call_model(provider, model, prompt, max_tokens=1500)
             if not result:
                 raise RuntimeError("Empty analysis")
-            logger.info("  [ANALYSIS] success: %s", key)
-            return result
+
+            # ✅ استخراج title_fa و analysis
+            title_fa, analysis = parse_analysis_response(result)
+            if not analysis:
+                analysis = result  # fallback: کل response را analysis بگذار
+
+            logger.info("  [ANALYSIS] success: %s | title_fa: %s", key, title_fa[:60] if title_fa else "(none)")
+            return (title_fa, analysis)
         except Exception as e:
             logger.warning("  [ANALYSIS ERROR] %s: %s", key, e)
             mark_model_error(key, str(e))
@@ -909,9 +994,8 @@ def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optio
         raise NoModelsAvailable("No models available for deep analysis")
     return None
 
-
 # ============================================================
-# PROCESS ENTRY
+# PROCESS ENTRY (با Title Translation)
 # ============================================================
 
 def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
@@ -966,17 +1050,22 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
         logger.info("  [RESULT] No article text available.")
         return {"status": "retry"}
 
-    analysis = deep_analyze(title, article_text, link, source)
-    if not analysis:
+    # ✅ deep_analyze حالا (title_fa, analysis) برمی‌گرداند
+    result = deep_analyze(title, article_text, link, source)
+    if not result:
         logger.info("  [RESULT] DEEP ANALYSIS FAILED")
         return {"status": "retry"}
 
-    success = send_telegram(title=title, analysis=analysis, link=link, category="اخبار منتخب", source=source)
+    title_fa, analysis = result
+
+    # ✅ اگر ترجمه‌ی عنوان موفق نبود، عنوان اصلی را استفاده کن
+    final_title = title_fa if title_fa else title
+
+    success = send_telegram(title=final_title, analysis=analysis, link=link, category="اخبار منتخب", source=source)
     if not success:
         logger.info("  [RESULT] Telegram failed.")
         return {"status": "retry"}
     return {"status": "sent"}
-
 
 # ============================================================
 # MAIN
@@ -1016,7 +1105,6 @@ def main() -> None:
     feeds = parsed.feeds
     logger.info("Feeds loaded: %d", len(feeds))
 
-    # ✅ Load state با seen_urls و seen_titles
     seen_ids, retry_counts, seen_urls, seen_titles = load_state()
     logger.info("Previously seen: %d IDs | %d URLs | %d titles | Pending retries: %d",
                 len(seen_ids), len(seen_urls), len(seen_titles), len(retry_counts))
@@ -1043,30 +1131,24 @@ def main() -> None:
     logger.info("Successful feeds: %d/%d", successful_feeds, len(feeds))
     logger.info("Downloaded entries: %d", len(all_entries))
 
-    # ✅ Triple Dedup: entry_id + normalized URL + title hash
+    # ✅ Triple Dedup
     candidates: List[Tuple[str, Any]] = []
     current_ids: Set[str] = set()
     current_urls: Set[str] = set()
     current_titles: Set[str] = set()
-
     skipped_seen = skipped_old = skipped_duplicate = 0
 
     for entry in all_entries:
         entry_id = get_entry_id(entry)
         if not entry_id:
             continue
-
-        # Check 1: entry_id در seen_ids
         if entry_id in seen_ids:
             skipped_seen += 1
             continue
-
-        # Check 2: entry_id تکراری در این اجرا
         if entry_id in current_ids:
             skipped_duplicate += 1
             continue
 
-        # ✅ Check 3: URL normalization dedup
         link = entry.get("link", "")
         norm_link = normalize_url(link) if link else ""
         if norm_link:
@@ -1075,7 +1157,6 @@ def main() -> None:
                 continue
             current_urls.add(norm_link)
 
-        # ✅ Check 4: Title hash dedup
         title = clean_html(entry.get("title", ""))
         title_hash = hashlib.sha256(title.lower().strip().encode("utf-8")).hexdigest() if title else ""
         if title_hash:
@@ -1084,7 +1165,6 @@ def main() -> None:
                 continue
             current_titles.add(title_hash)
 
-        # Check 5: تاریخ
         if not is_recent(entry):
             skipped_old += 1
             seen_ids.add(entry_id)
@@ -1122,7 +1202,6 @@ def main() -> None:
         try:
             result = process_entry(entry, index, total)
             status = result.get("status")
-
             if status in ("sent", "rejected"):
                 if status == "sent":
                     sent += 1
@@ -1130,8 +1209,6 @@ def main() -> None:
                     rejected += 1
                 successfully_processed.add(entry_id)
                 retry_counts.pop(entry_id, None)
-
-                # ✅ ثبت URL و title جدید برای dedup دائمی
                 link = entry.get("link", "")
                 norm_link = normalize_url(link) if link else ""
                 if norm_link:
@@ -1149,7 +1226,6 @@ def main() -> None:
                     retry_counts.pop(entry_id, None)
                 else:
                     retry_counts[entry_id] = count
-
         except NoModelsAvailable:
             logger.error("All providers unavailable — aborting run, state preserved.")
             break
@@ -1193,7 +1269,6 @@ def main() -> None:
         f"▫️ مدل‌های cooldown: {len(cooling)}"
     )
     send_status_message(finish_msg)
-
 
 # ============================================================
 # ENTRY POINT
