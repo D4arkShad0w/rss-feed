@@ -1,4 +1,4 @@
-````python
+
 import os
 import json
 import time
@@ -2227,4 +2227,3 @@ if __name__ == "__main__":
         )
 
         raise
-````
