@@ -1,5 +1,6 @@
-feedparser
 requests
+feedparser
 listparser
+beautifulsoup4
 google-genai
 groq
