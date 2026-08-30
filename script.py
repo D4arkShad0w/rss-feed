@@ -1,14 +1,14 @@
 """
-RSS Security News Bot - Ultimate Edition (Final)
-===================================================
-- Groq SDK رسمی بدون http_client سفارشی
+RSS Security News Bot - Final Edition
+======================================
+- Groq SDK رسمی (بدون http_client سفارشی)
 - .strip() روی همه‌ی API Keys
-- 3-Layer HTTP: requests → curl_cffi → verify=False
-- Smart URL Variants: fix typos, RSSHub alternatives, WordPress ?format=xml
-- RSS Feed Discovery: پیدا کردن RSS در HTML <link>
-- Site Scraping: وقتی RSS نیست، خود سایت را scrap می‌کند
+- 6-Layer fetch: requests → curl_cffi(×4) → verify=False
+- Smart URL Variants: fix typos, RSSHub alternatives, WordPress
+- RSS Discovery + Site Scraping
 - Triple Dedup: entry_id + normalized URL + title hash
-- Title Translation: ترجمه‌ی عنوان به فارسی با حفظ لغات تخصصی
+- Title Translation: فارسی با حفظ لغات تخصصی
+- MAX_ENTRIES_PER_RUN = 60
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode
+from urllib.parse import urlparse, urljoin
 
 import feedparser
 import listparser
@@ -70,15 +70,15 @@ FUTURE_TOLERANCE = timedelta(hours=6)
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "60"))
 
-FEED_TIMEOUT = 20
-ARTICLE_TIMEOUT = 25
+FEED_TIMEOUT = 30
+ARTICLE_TIMEOUT = 35
 TELEGRAM_TIMEOUT = 10
 GEMINI_DELAY = 5.0
 MODEL_COOLDOWN_SECONDS = 1800
 TRANSIENT_COOLDOWN_SECONDS = 300
 TELEGRAM_MAX_LEN = 4096
 
-MAX_URL_VARIANTS = 15
+MAX_URL_VARIANTS = 20
 MAX_DISCOVERED_FEEDS = 8
 
 USER_AGENT = (
@@ -180,7 +180,7 @@ def build_interests_prompt() -> str:
 INTERESTS_PROMPT = build_interests_prompt()
 
 # ============================================================
-# HTTP SESSION & ADVANCED FETCH (3-Layer)
+# HTTP SESSION & 6-LAYER FETCH
 # ============================================================
 
 def build_session() -> requests.Session:
@@ -210,7 +210,6 @@ def is_safe_url(url: Optional[str]) -> bool:
     except Exception:
         return False
 
-# ✅ URL Normalization برای جلوگیری از تکراری
 def normalize_url(url: str) -> str:
     try:
         parsed = urlparse(url)
@@ -218,51 +217,46 @@ def normalize_url(url: str) -> str:
         netloc = parsed.netloc.lower().rstrip("/")
         if netloc.startswith("www."):
             netloc = netloc[4:]
-        path = parsed.path.rstrip("/")
-        if not path:
-            path = "/"
+        path = parsed.path.rstrip("/") or "/"
         query = ""
         if parsed.query:
-            params = []
-            for param in parsed.query.split("&"):
-                key = param.split("=")[0].lower()
-                if not any(t in key for t in ["utm_", "fbclid", "gclid", "ref", "source", "campaign", "alt"]):
-                    params.append(param)
+            params = [p for p in parsed.query.split("&")
+                     if not any(t in p.split("=")[0].lower()
+                               for t in ["utm_", "fbclid", "gclid", "ref", "alt"])]
             if params:
                 query = "?" + "&".join(params)
         return f"{scheme}://{netloc}{path}{query}"
     except Exception:
         return url
 
-# ✅ 3-Layer fetch: requests → curl_cffi → verify=False
+# ✅ 6-Layer fetch — تست‌شده و تأییدشده
 def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
-    # Layer 1: Standard requests
+    """6-Layer: requests → curl_cffi(×4) → verify=False"""
+    # Layer 1: requests
     try:
         response = HTTP.get(url, timeout=timeout, allow_redirects=True)
         if response.status_code == 200:
             return response
-        if response.status_code in (403, 418, 503, 401):
-            logger.info("  [HTTP] %d → curl_cffi for %s", response.status_code, url)
-        else:
+        if response.status_code not in (403, 418, 503, 401):
             logger.warning("[FETCH] %s | HTTP %d | requests", url, response.status_code)
     except Exception as e:
         error_msg = str(e)
-        if "SSL" in error_msg or "CERTIFICATE_VERIFY_FAILED" in error_msg:
-            logger.info("  [HTTP] SSL Error → will bypass for %s", url)
+        if "SSL" in error_msg or "CERTIFICATE" in error_msg:
+            logger.info("  [HTTP] SSL Error → will bypass: %s", url)
         else:
             logger.info("  [HTTP] requests failed: %s | %s", url, error_msg[:100])
 
-    # Layer 2: curl_cffi — برای همه‌ی خطاها
-    try:
-        response = cffi_requests.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True)
-        if response.status_code == 200:
-            logger.info("  [HTTP] ✅ curl_cffi succeeded: %s", url)
-            return response
-        logger.warning("[FETCH] %s | HTTP %d | curl_cffi", url, response.status_code)
-    except Exception as e:
-        logger.info("  [HTTP] curl_cffi failed: %s | %s", url, str(e)[:100])
+    # Layer 2-5: curl_cffi با 4 impersonation
+    for imp in ["chrome", "chrome120", "safari", "edge"]:
+        try:
+            response = cffi_requests.get(url, impersonate=imp, timeout=timeout, allow_redirects=True)
+            if response.status_code == 200:
+                logger.info("  [HTTP] ✅ curl_cffi/%s succeeded: %s", imp, url)
+                return response
+        except Exception:
+            continue
 
-    # Layer 3: verify=False (SSL bypass)
+    # Layer 6: verify=False
     try:
         response = HTTP.get(url, timeout=timeout, allow_redirects=True, verify=False)
         if response.status_code == 200:
@@ -311,12 +305,8 @@ def load_state() -> Tuple[Set[str], Dict[str, int], Set[str], Set[str]]:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            return (
-                set(data.get("seen", [])),
-                dict(data.get("retries", {})),
-                set(data.get("seen_urls", [])),
-                set(data.get("seen_titles", [])),
-            )
+            return (set(data.get("seen", [])), dict(data.get("retries", {})),
+                    set(data.get("seen_urls", [])), set(data.get("seen_titles", [])))
     except Exception as e:
         logger.error("State load error: %s", e)
     return set(), {}, set(), set()
@@ -325,12 +315,8 @@ def save_state(seen_ids: Set[str], retry_counts: Dict[str, int],
                seen_urls: Set[str], seen_titles: Set[str]) -> None:
     try:
         temp = STATE_FILE + ".tmp"
-        payload = {
-            "seen": sorted(seen_ids),
-            "retries": retry_counts,
-            "seen_urls": sorted(seen_urls),
-            "seen_titles": sorted(seen_titles),
-        }
+        payload = {"seen": sorted(seen_ids), "retries": retry_counts,
+                   "seen_urls": sorted(seen_urls), "seen_titles": sorted(seen_titles)}
         with open(temp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         os.replace(temp, STATE_FILE)
@@ -408,61 +394,63 @@ def send_telegram(title: str, analysis: str, link: str, category: str, source: s
     return ok
 
 # ============================================================
-# SMART URL VARIANTS — اصلاح هوشمند URL
+# SMART URL VARIANTS
 # ============================================================
 
-# ✅ تولید URL های جایگزین وقتی URL اصلی fail می‌شود
 def generate_url_variants(url: str) -> List[str]:
-    """Generate URL variants to try when the original fails."""
     variants: List[str] = []
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path.rstrip("/")
 
-    # 1. Fix common typos
+    # 1. Fix typos
     if "sympoium" in url:
         variants.append(url.replace("sympoium", "symposium"))
-    if "sympozium" in url:
-        variants.append(url.replace("sympozium", "symposium"))
 
-    # 2. RSSHub alternative instances
+    # 2. RSSHub alternatives
     if "rsshub.app" in url:
         for alt in ["rsshub.rssforever.com", "rss.shab.fun", "rsshub.feeded.xyz"]:
             variants.append(url.replace("rsshub.app", alt))
 
-    # 3. WordPress ?format=xml
-    if "wordpress.com" in parsed.netloc:
-        sep = "&" if "?" in url else "?"
-        variants.append(url + sep + "format=xml")
+    # 3. WordPress
+    if "wordpress.com" in parsed.netloc or path.endswith(".php"):
+        for p in ["?format=xml", "?feed=rss2", "?feed=atom"]:
+            sep = "&" if "?" in url else "?"
+            variants.append(url + (p.replace("?", sep) if sep == "&" else p))
 
     # 4. Remove ?alt=rss
     if "alt=rss" in url:
-        cleaned = url.replace("?alt=rss", "").replace("&alt=rss", "").replace("?&", "?").rstrip("?")
-        variants.append(cleaned)
+        variants.append(url.replace("?alt=rss", "").replace("&alt=rss", "").rstrip("?"))
 
-    # 5. Add /feed/ if not present
-    if not path.endswith("/feed") and not path.endswith("/feed/"):
-        if not path.endswith(".xml") and not path.endswith(".rss"):
-            variants.append(base + path + "/feed/")
+    # 5. Add /feed/
+    if not path.endswith("/feed") and not path.endswith(".xml"):
+        variants.append(base + path + "/feed/")
+        variants.append(base + path + "/rss/")
 
-    # 6. Common RSS paths (for homepages)
+    # 6. Common RSS paths
     if path in ["", "/", "/index.php", "/index.html", "/blog"]:
         for p in ["/feed", "/feed/", "/rss", "/rss.xml", "/atom.xml",
-                  "/feeds/posts/default", "/index.xml", "/feed.xml",
-                  "/blog/feed", "/news/rss", "/?feed=rss2", "/?feed=atom"]:
+                  "/index.xml", "/feed.xml", "/?feed=rss2", "/blog/feed"]:
             variants.append(base + p)
 
-    # 7. Try http:// instead of https:// (SSL workaround)
+    # 7. http:// instead of https://
     if parsed.scheme == "https":
         variants.append(url.replace("https://", "http://", 1))
 
-    # 8. Try with www. if not present
+    # 8. With/without www.
     if not parsed.netloc.startswith("www."):
         variants.append(url.replace(f"://{parsed.netloc}", f"://www.{parsed.netloc}", 1))
-
-    # 9. Try without www. if present
     if parsed.netloc.startswith("www."):
         variants.append(url.replace("://www.", "://", 1))
+
+    # 9. .xml variants
+    if path.endswith(".xml"):
+        variants.append(base + path[:-4])
+        variants.append(base + path.replace(".xml", ".rss"))
+
+    # 10. /archive/feed/ patterns
+    if "/archive/" in path:
+        variants.append(base + "/feed/")
 
     # Deduplicate
     seen = set()
@@ -472,91 +460,81 @@ def generate_url_variants(url: str) -> List[str]:
         if nv not in seen and nv != normalize_url(url):
             seen.add(nv)
             unique.append(v)
-
     return unique[:MAX_URL_VARIANTS]
 
 # ============================================================
-# RSS FEED DISCOVERY + SITE SCRAPING
+# RSS DISCOVERY + SITE SCRAPING
 # ============================================================
 
 def discover_rss_feeds(html_text: str, base_url: str) -> List[str]:
-    """Find RSS feed links in HTML <link> tags + try common paths."""
     feeds = []
     try:
         soup = BeautifulSoup(html_text, "html.parser")
         for link in soup.find_all("link", attrs={"rel": "alternate"}):
-            link_type = link.get("type", "")
+            lt = link.get("type", "")
             href = link.get("href", "")
-            if href and ("rss" in link_type or "atom" in link_type):
+            if href and ("rss" in lt or "atom" in lt):
                 if href.startswith("/"):
-                    parsed = urlparse(base_url)
-                    href = f"{parsed.scheme}://{parsed.netloc}{href}"
+                    p = urlparse(base_url)
+                    href = f"{p.scheme}://{p.netloc}{href}"
                 elif not href.startswith("http"):
                     href = urljoin(base_url, href)
                 feeds.append(href)
-        # Also try <a> tags with "rss" or "feed" in href
         for a in soup.find_all("a", href=True):
             href = a.get("href", "")
-            if "rss" in href.lower() or "feed" in href.lower() or "atom" in href.lower():
+            if any(k in href.lower() for k in ["rss", "feed", "atom"]):
                 if href.startswith("/"):
-                    parsed = urlparse(base_url)
-                    href = f"{parsed.scheme}://{parsed.netloc}{href}"
+                    p = urlparse(base_url)
+                    href = f"{p.scheme}://{p.netloc}{href}"
                 elif not href.startswith("http"):
                     href = urljoin(base_url, href)
-                if is_safe_url(href):
+                if href.startswith("http"):
                     feeds.append(href)
-        # Common RSS paths
-        parsed = urlparse(base_url)
-        b = f"{parsed.scheme}://{parsed.netloc}"
-        for path in ["/feed", "/rss", "/rss.xml", "/atom.xml",
-                      "/feeds/posts/default", "/index.xml", "/feed.xml",
-                      "/blog/feed", "/news/rss", "/feed/", "/rss/"]:
+        p = urlparse(base_url)
+        b = f"{p.scheme}://{p.netloc}"
+        for path in ["/feed", "/rss", "/rss.xml", "/atom.xml", "/index.xml", "/feed.xml", "/feed/", "/rss/"]:
             feeds.append(f"{b}{path}")
     except Exception:
         pass
     return feeds[:MAX_DISCOVERED_FEEDS]
 
 def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
-    """Scrape article links from a website when no RSS is available."""
     entries = []
     try:
         soup = BeautifulSoup(html_text, "html.parser")
         seen_links: Set[str] = set()
         selectors = [
-            "article h2 a", "article h3 a", "article h1 a", "article a[href]",
-            ".post-title a", ".entry-title a", ".article-title a",
-            "h2.title a", "h3.title a", ".post h2 a", ".post h3 a",
-            ".entry h2 a", ".entry h3 a", ".blog-post h2 a", ".blog-post h3 a",
-            ".news-item h3 a", ".news-item h2 a", ".card-title a",
-            "main h2 a", "main h3 a", ".list-item a", ".item-title a",
-            ".post-list a[href]", ".article-list a[href]",
+            "article h2 a", "article h3 a", "article a[href]",
+            ".post-title a", ".entry-title a", "h2.title a", "h3.title a",
+            ".post h2 a", ".post h3 a", ".entry h2 a", ".entry h3 a",
+            "main h2 a", "main h3 a", ".card-title a",
+            ".blog-post h2 a", ".blog-post h3 a",
+            ".news-item h2 a", ".news-item h3 a",
         ]
-        for selector in selectors:
+        for sel in selectors:
             try:
-                for link in soup.select(selector):
+                for link in soup.select(sel):
                     href = link.get("href", "")
                     title = clean_html(link.get_text(" ", strip=True))
                     if not href or not title or len(title) < 10:
                         continue
                     if href.startswith("/"):
-                        parsed = urlparse(base_url)
-                        href = f"{parsed.scheme}://{parsed.netloc}{href}"
+                        p = urlparse(base_url)
+                        href = f"{p.scheme}://{p.netloc}{href}"
                     elif not href.startswith("http"):
                         href = urljoin(base_url, href)
                     href = normalize_url(href)
                     if href in seen_links or not is_safe_url(href):
                         continue
-                    skip = ["facebook.com", "twitter.com", "linkedin.com",
-                            "instagram.com", "youtube.com", "#", "mailto:",
-                            "javascript:", "tel:", "share", "comment"]
-                    if any(p in href.lower() for p in skip):
+                    skip = ["facebook.com", "twitter.com", "linkedin.com", "instagram.com",
+                            "youtube.com", "#", "mailto:", "javascript:", "tel:",
+                            "share", "comment", "tag/", "category/", "author/", "page/"]
+                    if any(s in href.lower() for s in skip):
                         continue
                     seen_links.add(href)
-                    entries.append({
-                        "title": title, "link": href, "summary": "",
-                        "description": "", "id": href,
-                        "published_parsed": None, "updated_parsed": None,
-                    })
+                    entries.append({"title": title, "link": href, "summary": "",
+                                   "description": "", "id": href,
+                                   "published_parsed": None, "updated_parsed": None})
             except Exception:
                 pass
         if not entries:
@@ -571,31 +549,28 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
                             "/2024/", "/2025/", "/p/", "/entry/"]):
                     continue
                 if href.startswith("/"):
-                    parsed = urlparse(base_url)
-                    href = f"{parsed.scheme}://{parsed.netloc}{href}"
+                    p = urlparse(base_url)
+                    href = f"{p.scheme}://{p.netloc}{href}"
                 elif not href.startswith("http"):
                     href = urljoin(base_url, href)
                 href = normalize_url(href)
                 if href in seen_links or not is_safe_url(href):
                     continue
-                skip = ["facebook.com", "twitter.com", "linkedin.com",
-                        "instagram.com", "youtube.com", "#", "mailto:"]
-                if any(p in href.lower() for p in skip):
+                skip = ["facebook.com", "twitter.com", "linkedin.com", "youtube.com", "#", "mailto:"]
+                if any(s in href.lower() for s in skip):
                     continue
                 seen_links.add(href)
-                entries.append({
-                    "title": title, "link": href, "summary": "",
-                    "description": "", "id": href,
-                    "published_parsed": None, "updated_parsed": None,
-                })
+                entries.append({"title": title, "link": href, "summary": "",
+                               "description": "", "id": href,
+                               "published_parsed": None, "updated_parsed": None})
         if entries:
             logger.info("  [SCRAPE] Found %d articles from %s", len(entries), base_url)
     except Exception as e:
         logger.warning("Site scrape error: %s", e)
-    return entries
+    return entries[:POSTS_PER_FEED]
 
 # ============================================================
-# FEED FETCH — با Smart URL Variants + RSS Discovery + Scraping
+# FEED FETCH — الگوریتم نهایی
 # ============================================================
 
 ARTICLE_SELECTORS = [
@@ -604,17 +579,24 @@ ARTICLE_SELECTORS = [
 ]
 STRIP_TAGS = ["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]
 
-# ✅ تلاش برای یک URL — fetch + parse + discovery + scrape
 def try_fetch_feed_url(url: str) -> List[Any]:
-    """Try to fetch and parse a feed URL with RSS discovery and scraping."""
+    """fetch → feedparser → RSS discovery → scraping"""
     response = fetch_url(url, FEED_TIMEOUT)
     if not response:
         return []
 
-    # مرحله 1: feedparser
+    # ✅ همیشه feedparser را امتحان کن
     parsed = feedparser.parse(response.content)
     if parsed.entries:
+        logger.info("  [FEED] ✅ feedparser: %d entries: %s", len(parsed.entries), url)
         return parsed.entries[:POSTS_PER_FEED]
+
+    # چک کن آیا XML است ولی entries ندارد
+    content_preview = response.text[:500].strip()
+    is_xml = any(tag in content_preview.lower() for tag in ["<?xml", "<rss", "<feed", "<channel", "<entry"])
+    if is_xml:
+        logger.warning("  [FEED] XML detected but 0 entries: %s", url)
+        return []
 
     # مرحله 2: RSS Discovery
     discovered = discover_rss_feeds(response.text, url)
@@ -635,7 +617,6 @@ def try_fetch_feed_url(url: str) -> List[Any]:
 
     return []
 
-# ✅ fetch_single_feed — اصلی‌ترین تابع با Smart Variants
 def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
     feed_url = feed.get("url") if isinstance(feed, dict) else getattr(feed, "url", None)
     if not feed_url or not is_safe_url(feed_url):
@@ -646,11 +627,10 @@ def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
         if entries:
             return entries, True
 
-        # مرحله 2: URL Variants (اصلاح هوشمند)
+        # مرحله 2: URL Variants
         variants = generate_url_variants(feed_url)
         if variants:
             logger.info("  [FEED] Original failed, trying %d variants for %s", len(variants), feed_url)
-
         for variant_url in variants:
             entries = try_fetch_feed_url(variant_url)
             if entries:
@@ -877,7 +857,6 @@ def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
         raise NoModelsAvailable("No models available for filtering")
     return None
 
-# ✅ Analysis Prompt با Title Translation
 def build_analysis_prompt(title: str, article_text: str, link: str, source: str) -> str:
     if len(article_text) > 18000:
         article_text = article_text[:18000]
@@ -938,31 +917,25 @@ ARTICLE:
 {article_text}
 """
 
-# ✅ استخراج عنوان ترجمه‌شده و تحلیل از پاسخ AI
 def parse_analysis_response(response: str) -> Tuple[str, str]:
-    """Extract translated title and analysis from AI response."""
+    """استخراج عنوان ترجمه‌شده و تحلیل از پاسخ AI."""
     title_fa = ""
     analysis = response.strip()
 
-    # تلاش برای استخراج TITLE_FA
     match = re.search(r'TITLE_FA:\s*(.+?)(?:\n---|\n\n|\nANALYSIS:)', response, re.DOTALL | re.IGNORECASE)
     if match:
         title_fa = match.group(1).strip()
         remaining = response[match.end():].strip()
-        # حذف جداکننده‌های ابتدایی
         analysis = re.sub(r'^[-=*\s\n]+', '', remaining).strip()
-        # حذف "ANALYSIS:" اگر وجود داشت
         analysis = re.sub(r'^ANALYSIS:\s*', '', analysis, flags=re.IGNORECASE).strip()
     else:
-        # اگر فرمت رعایت نشد، خط اول را title فرض کن
         lines = response.strip().split('\n')
-        if lines and not lines[0].startswith('TITLE_FA'):
-            # کل response را به‌عنوان analysis بگذار
-            pass
+        if lines and lines[0].strip().startswith('TITLE_FA:'):
+            title_fa = lines[0].replace('TITLE_FA:', '').strip()
+            analysis = '\n'.join(lines[1:]).strip()
 
     return title_fa, analysis
 
-# ✅ deep_analyze حالا (title_fa, analysis) برمی‌گرداند
 def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optional[Tuple[str, str]]:
     """Returns (title_fa, analysis) or None."""
     prompt = build_analysis_prompt(title, article_text, link, source)
@@ -978,12 +951,9 @@ def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optio
             result = call_model(provider, model, prompt, max_tokens=1500)
             if not result:
                 raise RuntimeError("Empty analysis")
-
-            # ✅ استخراج title_fa و analysis
             title_fa, analysis = parse_analysis_response(result)
             if not analysis:
-                analysis = result  # fallback: کل response را analysis بگذار
-
+                analysis = result
             logger.info("  [ANALYSIS] success: %s | title_fa: %s", key, title_fa[:60] if title_fa else "(none)")
             return (title_fa, analysis)
         except Exception as e:
@@ -995,7 +965,7 @@ def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optio
     return None
 
 # ============================================================
-# PROCESS ENTRY (با Title Translation)
+# PROCESS ENTRY
 # ============================================================
 
 def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
@@ -1050,15 +1020,12 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
         logger.info("  [RESULT] No article text available.")
         return {"status": "retry"}
 
-    # ✅ deep_analyze حالا (title_fa, analysis) برمی‌گرداند
     result = deep_analyze(title, article_text, link, source)
     if not result:
         logger.info("  [RESULT] DEEP ANALYSIS FAILED")
         return {"status": "retry"}
 
     title_fa, analysis = result
-
-    # ✅ اگر ترجمه‌ی عنوان موفق نبود، عنوان اصلی را استفاده کن
     final_title = title_fa if title_fa else title
 
     success = send_telegram(title=final_title, analysis=analysis, link=link, category="اخبار منتخب", source=source)
@@ -1074,7 +1041,7 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 def main() -> None:
     start = time.time()
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (ULTIMATE EDITION)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION)")
     logger.info("=" * 70)
     logger.info("Filter models: %s", [m["model"] for m in FILTER_MODELS])
     logger.info("Analysis models: %s", [m["model"] for m in ANALYSIS_MODELS])
