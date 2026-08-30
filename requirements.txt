@@ -1,10 +1,9 @@
+groq
+httpx
 requests
 feedparser
 listparser
 beautifulsoup4
-urllib3
-groq
+lxml
 google-genai
-openai
-httpx
 curl_cffi
