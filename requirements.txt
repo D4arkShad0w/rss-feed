@@ -2,3 +2,4 @@ feedparser
 requests
 listparser
 google-genai
+groq
