@@ -2,38 +2,11 @@
 RSS Security News Bot
 ======================
 
-Fetches feeds from an OPML file, filters entries against a set of interest
-categories using a cascade of LLMs (Groq -> Gemini, weak -> strong), runs a
-deep analysis pass on anything relevant, and posts the result to Telegram.
-
-Changes vs. the previous version (see PR/diff for details):
-  - Telegram messages now use HTML parse mode instead of Markdown. Markdown
-    broke (and silently failed to send) whenever a title/analysis/URL
-    contained characters like `)`, `[`, `*`, etc. HTML only needs `&`, `<`,
-    `>` escaped, which is trivial to get right.
-  - `extract_original_link` (WeChat original-link recovery) was dead code:
-    it was never called, and even if it had been, it was being fed
-    *cleaned* text with all HTML tags (and therefore all hrefs) stripped.
-    It's now wired in and given real raw HTML to search.
-  - `parse_filter_result` now checks for an exact "RELEVANT"/"REJECT"
-    response first, only falling back to substring search if the model
-    didn't follow instructions exactly.
-  - Entries that fail repeatedly (bad page, model can't parse it, etc.) are
-    now capped at MAX_RETRIES attempts instead of retrying forever.
-  - If neither GROQ_API_KEY nor GEMINI_API_KEY is configured, the bot now
-    fails fast with a clear message instead of silently "retrying" every
-    candidate all the way through the run.
-  - Future-dated / clock-skewed entries are no longer permanently
-    blacklisted by a single bad timestamp.
-  - HTTP calls go through a shared `requests.Session` with retry/backoff,
-    and article URLs are checked to be http(s) before being fetched.
-  - `print()` calls replaced with the `logging` module.
-  - Gemini 3.x thinking tokens are bounded via `thinking_config` and 
-    `max_output_tokens` is properly sized.
-  - Provider-level cooldown for connection errors so one dead socket 
-    doesn't kill four models.
-  - Aborts run instead of burning retry counts for every article when 
-    infrastructure is down.
+Final optimized version:
+- Uses cloudscraper to bypass 403 Forbidden on sites like CACM/Phishlabs.
+- Respects Gemini's 15 RPM free tier limit using a 5-second delay.
+- Uses valid Groq (gpt-oss) and Gemini 3.x models.
+- Aborts safely when all models are rate-limited to protect retry counts.
 """
 
 from __future__ import annotations
@@ -51,8 +24,8 @@ from urllib.parse import urlparse
 
 import feedparser
 import listparser
-import requests
 import httpx
+import cloudscraper
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -66,14 +39,13 @@ try:
 except ImportError:
     GROQ_AVAILABLE = False
 
-
 # ============================================================
 # LOGGING
 # ============================================================
 
-logging_format = "%(asctime)s [%(levelname)s] %(message)s"
-import logging  # noqa: E402  (kept near other stdlib imports intentionally)
+import logging
 
+logging_format = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=logging_format, datefmt="%H:%M:%S")
 logger = logging.getLogger("rss_security_bot")
 
@@ -95,7 +67,7 @@ MAX_WORKERS = 20
 POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "50"))
 
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
-FUTURE_TOLERANCE = timedelta(hours=6)  # forgive minor feed clock-skew
+FUTURE_TOLERANCE = timedelta(hours=6)
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "40"))
@@ -104,7 +76,8 @@ FEED_TIMEOUT = 15
 ARTICLE_TIMEOUT = 20
 TELEGRAM_TIMEOUT = 10
 
-GEMINI_DELAY = 0.3
+# 5 seconds delay keeps us safely under 15 RPM for Gemini free tier
+GEMINI_DELAY = 5.0
 MODEL_COOLDOWN_SECONDS = 1800
 TRANSIENT_COOLDOWN_SECONDS = 300
 
@@ -120,27 +93,19 @@ USER_AGENT = (
 # MODEL CONFIGURATION
 # ============================================================
 
-# weak -> strong. The next model is used ONLY when the previous model
-# raises/fails. A normal RELEVANT / REJECT response never triggers fallback.
-
 FILTER_MODELS = [
     {"provider": "groq", "model": "llama-3.1-8b-instant"},
-    {"provider": "groq", "model": "openai/gpt-oss-20b"},
-    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
-    {"provider": "groq", "model": "openai/gpt-oss-120b"},
     {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-    {"provider": "gemini", "model": "gemini-3.7-flash"},
-    {"provider": "gemini", "model": "gemini-3.1-pro-preview"},
+    {"provider": "groq", "model": "openai/gpt-oss-20b"},
+    {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
 ]
 
-# 8B is intentionally NOT used here; deep analysis starts from GPT-OSS 20B.
 ANALYSIS_MODELS = [
-    {"provider": "groq", "model": "openai/gpt-oss-20b"},
-    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
     {"provider": "groq", "model": "openai/gpt-oss-120b"},
     {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-    {"provider": "gemini", "model": "gemini-3.7-flash"},
-    {"provider": "gemini", "model": "gemini-3.1-pro-preview"},
+    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+    {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
 ]
 
 
@@ -165,7 +130,6 @@ def is_transient_error(reason: str) -> bool:
 
 
 def cooldown_for(reason: str) -> int:
-    # Parse failures shouldn't put a model in cooldown
     if "Invalid filter" in reason or "Empty analysis" in reason:
         return 0
     if is_transient_error(reason):
@@ -190,7 +154,6 @@ def mark_model_error(model_key: str, reason: str = "") -> None:
 
     model_error_state[model_key] = (time.time(), cooldown)
     
-    # Mark provider if it's a connection issue
     if "connection" in reason.lower():
         provider = model_key.split("/", 1)[0]
         model_error_state[f"__provider__/{provider}"] = (time.time(), cooldown)
@@ -334,12 +297,25 @@ INTERESTS_PROMPT = build_interests_prompt()
 
 
 # ============================================================
-# HTTP SESSION
+# HTTP SESSION (Cloudscraper + Full Browser Headers)
 # ============================================================
 
-def build_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+def build_session() -> Any:
+    # cloudscraper acts as a drop-in replacement and bypasses Cloudflare/WAF 403s
+    session = cloudscraper.create_scraper()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    })
     retry = Retry(
         total=2,
         connect=2,
@@ -402,8 +378,6 @@ else:
 # ============================================================
 # STATE
 # ============================================================
-# State file format: {"seen": [ids...], "retries": {id: count}}
-# Older files (a bare JSON list of ids) are still read correctly.
 
 def load_state() -> Tuple[Set[str], Dict[str, int]]:
     if not os.path.exists(STATE_FILE):
@@ -448,7 +422,6 @@ def clean_html(text: Any) -> str:
 
 
 def escape_html_text(text: Any) -> str:
-    """Escape text for Telegram HTML parse mode (only &, <, > matter)."""
     if not text:
         return ""
     return html.escape(str(text), quote=False)
@@ -636,8 +609,6 @@ def detect_source(entry: Any) -> str:
 
 
 def extract_original_link(fallback_url: str, *html_sources: Optional[str]) -> str:
-    """Search raw HTML (article page and/or RSS summary HTML) for a direct
-    mp.weixin.qq.com link. Falls back to fallback_url if none is found."""
     for source_html in html_sources:
         if not source_html:
             continue
@@ -673,13 +644,10 @@ def get_entry_id(entry: Any) -> Optional[str]:
 def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
-        # If no date, don't blindly allow it (can let ancient undated items flood in)
         return False
     try:
         date = datetime(*parsed[:6], tzinfo=timezone.utc)
         age = datetime.now(timezone.utc) - date
-        # Allow a little slack for future-dated / clock-skewed entries
-        # instead of permanently blacklisting them on a bad timestamp.
         return -FUTURE_TOLERANCE <= age <= timedelta(days=max_age_days)
     except Exception:
         return False
@@ -731,8 +699,6 @@ def call_gemini(model_name: str, prompt: str, max_tokens: int = 700) -> str:
 
     kwargs: Dict[str, Any] = {"max_output_tokens": max(max_tokens, 512)}
     if model_name.startswith("gemini-3"):
-        # Thinking tokens come out of max_output_tokens. Keep it minimal
-        # and leave temperature at the recommended default of 1.0.
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
     else:
         kwargs["temperature"] = 0.2
@@ -807,16 +773,12 @@ def parse_filter_result(result: Optional[str]) -> Optional[bool]:
 
     text = re.sub(r"```", "", result).strip().upper()
 
-    # Prefer an exact match on the whole trimmed response — this is what
-    # the prompt asks for and avoids substring false-positives (e.g. a
-    # stray "NOT RELEVANT" still containing the word "RELEVANT").
     stripped = text.strip(" .!\n\t")
     if stripped == "RELEVANT":
         return True
     if stripped == "REJECT":
         return False
 
-    # Fallback for models that didn't follow instructions exactly.
     match = re.search(r"\b(RELEVANT|REJECT)\b", text)
     if match:
         return match.group(1) == "RELEVANT"
@@ -1144,7 +1106,7 @@ def main() -> None:
 
         if not is_recent(entry):
             skipped_old += 1
-            seen_ids.add(entry_id)  # old items never need retry
+            seen_ids.add(entry_id)
             retry_counts.pop(entry_id, None)
             continue
 
@@ -1204,7 +1166,6 @@ def main() -> None:
         except Exception as e:
             logger.error("[FATAL ENTRY ERROR] %s", e)
             failed += 1
-            # Don't count infrastructure exceptions against retries
             successfully_processed.add(entry_id)
             retry_counts.pop(entry_id, None)
 
