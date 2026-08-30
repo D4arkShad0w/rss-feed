@@ -3,6 +3,7 @@ feedparser
 listparser
 beautifulsoup4
 urllib3
+groq
 google-genai
 openai
 httpx
