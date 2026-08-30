@@ -10,9 +10,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
 from google.genai import types
 
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    print("[-] Groq library not found, Groq will be skipped.")
+    GROQ_AVAILABLE = False
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API")
 
 OPML_FILE = "feeds.opml"
 STATE_FILE = "seen_ids.json"
@@ -22,6 +30,33 @@ POSTS_PER_FEED = 50
 MAX_AGE_DAYS = 7
 TIMEOUT = 10
 GEMINI_DELAY = 0.3
+
+# --- سیستم خنک‌کنندگی هوشمند ---
+MODEL_COOLDOWN_SECONDS = 1800  # 30 دقیقه خنک‌کنندگی بعد از خطا
+model_error_times = {}         # {model_key: timestamp_of_last_error}
+
+def should_skip_model(model_key):
+    """بررسی می‌کند که آیا مدل در حال حاضر در دوره خنک‌کنندگی است یا خیر"""
+    if model_key not in model_error_times:
+        return False
+    last_error = model_error_times[model_key]
+    return (time.time() - last_error) < MODEL_COOLDOWN_SECONDS
+
+def mark_model_error(model_key):
+    """علامت‌گذاری مدل به عنوان خراب برای دوره خنک‌کنندگی"""
+    model_error_times[model_key] = time.time()
+    print(f"    [!] {model_key} cooldown activated for {MODEL_COOLDOWN_SECONDS/60:.0f} minutes.")
+
+# --- لیست مدل‌ها به ترتیب اولویت شما ---
+MODELS_FALLBACK = [
+    {"provider": "groq", "model": "llama-3.1-8b-instant"},
+    {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+    {"provider": "groq", "model": "openai/gpt-oss-120b"},
+    {"provider": "groq", "model": "openai/gpt-oss-20b"},
+    {"provider": "gemini", "model": "gemini-2.5-flash-lite"},
+    {"provider": "gemini", "model": "gemini-2.5-flash"},
+    {"provider": "gemini", "model": "gemini-2.5-pro"},
+]
 
 INTEREST_CATEGORIES = {
     "LOW-LEVEL SECURITY": [
@@ -123,10 +158,16 @@ INTEREST_CATEGORIES = {
 }
 
 try:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
     print(f"[-] Gemini init failed: {e}")
-    client = None
+    gemini_client = None
+
+try:
+    groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_AVAILABLE and GROQ_API_KEY else None
+except Exception as e:
+    print(f"[-] Groq init failed: {e}")
+    groq_client = None
 
 def load_seen_ids():
     if os.path.exists(STATE_FILE):
@@ -187,7 +228,6 @@ def is_recent(entry, max_age_days=MAX_AGE_DAYS):
     return datetime.utcnow() - published_date <= timedelta(days=max_age_days)
 
 def parse_ai_response(ai_result):
-    """پارس کردن پاسخ هوش مصنوعی با عبارات منظم برای انعطاف‌پذیری بیشتر"""
     if not ai_result:
         return None
     
@@ -210,16 +250,38 @@ def parse_ai_response(ai_result):
     
     return None
 
-def analyze_with_gemini(title, summary):
-    if not client: return "REJECT"
+def call_gemini(model_name, prompt):
+    if not gemini_client:
+        raise Exception("Gemini client not initialized")
     
+    response = gemini_client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.5),
+    )
+    return response.text.strip()
+
+def call_groq(model_name, prompt):
+    if not groq_client:
+        raise Exception("Groq client not initialized")
+    
+    chat_completion = groq_client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": "تو یک تحلیلگر ارشد امنیت سایبری، پژوهشگر ریاضیات و ژئوپلیتیک فناوری هستی. وظیفه تو فیلتر کردن اخبار بر اساس علاقه‌مندی‌های کاربر است."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5,
+        max_tokens=1024,
+    )
+    return chat_completion.choices[0].message.content.strip()
+
+def analyze_with_multi_provider(title, summary):
     clean_title = clean_html(title)
     clean_summary = clean_html(summary)
     if len(clean_summary) > 3000: clean_summary = clean_summary[:3000]
 
-    prompt = f"""تو یک تحلیلگر ارشد امنیت سایبری، پژوهشگر ریاضیات و ژئوپلیتیک فناوری هستی. وظیفه تو فیلتر کردن اخبار زیر بر اساس علاقه‌مندی‌های کاربر است.
-
-حوزه‌های مورد علاقه کاربر:
+    prompt = f"""حوزه‌های مورد علاقه کاربر:
 {INTERESTS_PROMPT}
 
 خبر زیر را ارزیابی کن:
@@ -239,23 +301,48 @@ SUMMARY: این گزارش یک کمپین جدید جاسوسی سایبری ر
 مثال خروجی رد شده:
 REJECT
 
-خروجی تو باید دقیقاً یکی از دو فرمت بالا باشد. اگر خبر مرتبط است، فرمت کامل را برگردان:
-"""
+خروجی تو باید دقیقاً یکی از دو فرمت بالا باشد. اگر خبر مرتبط است، فرمت کامل را برگردان:"""
 
-    try:
-        response = client.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.5),
-        )
-        return response.text.strip()
-    except Exception as e:
-        print(f"  [-] Gemini error: {e}")
-        return "REJECT"
+    for provider_info in MODELS_FALLBACK:
+        provider = provider_info["provider"]
+        model_name = provider_info["model"]
+        model_key = f"{provider}/{model_name}"
+        
+        # اگر مدل در حال حاضر در دوره خنک‌کنندگی است، رد شو
+        if should_skip_model(model_key):
+            continue
+        
+        try:
+            if provider == "groq":
+                result = call_groq(model_name, prompt)
+            elif provider == "gemini":
+                result = call_gemini(model_name, prompt)
+            else:
+                continue
+            
+            print(f"    [+] Success with {model_key}")
+            return result
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            error_code = getattr(e, 'code', None) or getattr(e, 'status_code', None)
+            
+            # اگر خطای مربوط به نرخ محدود یا مدل در دسترس نبود، مدل را خنک کن
+            if any(x in error_str for x in ['429', 'rate limit', 'quota', '404', 'not found']):
+                mark_model_error(model_key)
+                continue
+            
+            # سایر خطاها هم مدل را خنک می‌کنند
+            print(f"  [-] Error with {model_key}: {e}")
+            mark_model_error(model_key)
+            continue
+    
+    print(f"  [-] All providers/models failed or cooling down for this request")
+    return "REJECT"
 
 def main():
     start_time = time.time()
-    send_status_message("🚀 **ربات شروع شد:** در حال دانلود موازی فیدها...")
+    send_status_message("🚀 **ربات شروع شد:** در حال دانلود موازی فیدها با سیستم خنک‌کنندگی هوشمند...")
 
     seen_ids = load_seen_ids()
     new_seen_ids = set(seen_ids)
@@ -320,7 +407,7 @@ def main():
         
         print(f"  [{i+1}/{len(unique_entries)}] {title[:50]}...")
         
-        ai_result = analyze_with_gemini(title, summary)
+        ai_result = analyze_with_multi_provider(title, summary)
         parsed = parse_ai_response(ai_result)
         
         if parsed:
@@ -345,13 +432,16 @@ def main():
 
     save_seen_ids(new_seen_ids)
     
+    # گزارش وضعیت خنک‌کنندگی
+    cooling_models = [k for k in model_error_times if should_skip_model(k)]
     elapsed = round(time.time() - start_time, 1)
     status_summary = (
         f"✅ **پایان اجرا در {elapsed} ثانیه.**\n"
         f"▫️ پست‌های جدید بررسی‌شده: {len(unique_entries)}\n"
         f"▫️ تایید و ارسال‌شده: {sent_count}\n"
         f"▫️ رد شده: {rejected_count}\n"
-        f"▫️ خطاهای پارس: {parse_errors}"
+        f"▫️ خطاهای پارس: {parse_errors}\n"
+        f"▫️ مدل‌های در حال خنک‌کنندگی: {len(cooling_models)}"
     )
     send_status_message(status_summary)
 
