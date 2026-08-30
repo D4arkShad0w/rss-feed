@@ -1,12 +1,11 @@
 """
-RSS Security News Bot
-======================
-
-Final optimized version:
-- Uses cloudscraper to bypass 403 Forbidden on sites like CACM/Phishlabs.
-- Respects Gemini's 15 RPM free tier limit using a 5-second delay.
-- Uses valid Groq (gpt-oss) and Gemini 3.x models.
-- Aborts safely when all models are rate-limited to protect retry counts.
+RSS Security News Bot - Ultimate Edition
+========================================
+- Uses OpenAI SDK for Groq to maximize connection stability in GitHub Actions.
+- Uses curl_cffi (Chrome Impersonation) as a fallback to aggressively bypass 403 WAFs.
+- Sequential AI cascade (Gemini -> Groq) with provider-level cooldowns.
+- Aborts safely if all models are rate-limited to protect article retry counts.
+- 5-second delay to strictly respect Gemini's free tier RPM limit.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from urllib.parse import urlparse
 import feedparser
 import listparser
 import httpx
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -34,10 +33,12 @@ from google import genai
 from google.genai import types
 
 try:
-    from groq import Groq
+    from openai import OpenAI
     GROQ_AVAILABLE = True
 except ImportError:
     GROQ_AVAILABLE = False
+
+from curl_cffi import requests as cffi_requests
 
 # ============================================================
 # LOGGING
@@ -58,7 +59,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 OPML_FILE = "feeds.opml"
 STATE_FILE = "seen_ids.json"
@@ -76,7 +77,7 @@ FEED_TIMEOUT = 15
 ARTICLE_TIMEOUT = 20
 TELEGRAM_TIMEOUT = 10
 
-# 5 seconds delay keeps us safely under 15 RPM for Gemini free tier
+# 5 seconds delay keeps us safely under 15 RPM for Gemini free tier limit
 GEMINI_DELAY = 5.0
 MODEL_COOLDOWN_SECONDS = 1800
 TRANSIENT_COOLDOWN_SECONDS = 300
@@ -93,19 +94,22 @@ USER_AGENT = (
 # MODEL CONFIGURATION
 # ============================================================
 
+# Prioritizing Gemini first for filtering to avoid Groq timeouts.
 FILTER_MODELS = [
-    {"provider": "groq", "model": "llama-3.1-8b-instant"},
     {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
-    {"provider": "groq", "model": "openai/gpt-oss-20b"},
+    {"provider": "groq", "model": "llama-3.1-8b-instant"},
     {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+    {"provider": "groq", "model": "openai/gpt-oss-20b"},
     {"provider": "groq", "model": "llama-3.3-70b-versatile"},
 ]
 
+# For deep analysis, start with heavy Groq models, fallback to Gemini.
 ANALYSIS_MODELS = [
     {"provider": "groq", "model": "openai/gpt-oss-120b"},
     {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
     {"provider": "groq", "model": "llama-3.3-70b-versatile"},
     {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+    {"provider": "groq", "model": "openai/gpt-oss-20b"},
 ]
 
 
@@ -297,12 +301,11 @@ INTERESTS_PROMPT = build_interests_prompt()
 
 
 # ============================================================
-# HTTP SESSION (Cloudscraper + Full Browser Headers)
+# HTTP SESSION & ROBUST GET
 # ============================================================
 
-def build_session() -> Any:
-    # cloudscraper acts as a drop-in replacement and bypasses Cloudflare/WAF 403s
-    session = cloudscraper.create_scraper()
+def build_session() -> requests.Session:
+    session = requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -329,9 +332,7 @@ def build_session() -> Any:
     session.mount("https://", adapter)
     return session
 
-
 HTTP = build_session()
-
 
 def is_safe_url(url: Optional[str]) -> bool:
     if not url:
@@ -341,6 +342,24 @@ def is_safe_url(url: Optional[str]) -> bool:
         return parsed.scheme in ("http", "https") and bool(parsed.netloc)
     except Exception:
         return False
+
+def robust_get(url: str, timeout: int) -> Optional[requests.Response]:
+    """Tries standard requests, falls back to Chrome impersonation via curl_cffi."""
+    try:
+        response = HTTP.get(url, timeout=timeout, allow_redirects=True)
+        # If blocked by WAF, try to bypass
+        if response.status_code in (403, 418, 503, 401):
+            raise requests.exceptions.RequestException("Blocked by WAF")
+        return response
+    except Exception as e:
+        logger.info("  [HTTP] Standard GET failed (%s), trying Chrome impersonation...", str(e)[:100])
+        try:
+            cffi_resp = cffi_requests.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True)
+            logger.info("  [HTTP] curl_cffi impersonation returned %d", cffi_resp.status_code)
+            return cffi_resp
+        except Exception as e2:
+            logger.warning("  [HTTP] Fallback failed: %s", str(e2)[:200])
+            return None
 
 
 # ============================================================
@@ -361,18 +380,20 @@ else:
 
 if GROQ_AVAILABLE and GROQ_API_KEY:
     try:
-        groq_client = Groq(
+        # Using OpenAI SDK pointed to Groq's endpoint for max stability
+        groq_client = OpenAI(
             api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
             http_client=httpx.Client(
                 transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=2),
                 timeout=30.0,
             ),
         )
-        logger.info("Groq initialized (forced IPv4).")
+        logger.info("Groq initialized via OpenAI SDK (forced IPv4).")
     except Exception as e:
         logger.error("Groq init failed: %s", e)
 else:
-    logger.warning("GROQ_API_KEY missing or groq package not installed.")
+    logger.warning("GROQ_API_KEY missing or openai package not installed.")
 
 
 # ============================================================
@@ -506,7 +527,7 @@ def send_telegram(
 
 
 # ============================================================
-# FEED FETCH
+# FEED & ARTICLE FETCH
 # ============================================================
 
 def fetch_single_feed(feed: Any) -> List[Any]:
@@ -514,20 +535,16 @@ def fetch_single_feed(feed: Any) -> List[Any]:
     if not feed_url or not is_safe_url(feed_url):
         return []
     try:
-        response = HTTP.get(feed_url, timeout=FEED_TIMEOUT)
-        if response.status_code != 200:
-            logger.info("Feed HTTP %s: %s", response.status_code, feed_url)
+        response = robust_get(feed_url, FEED_TIMEOUT)
+        if not response or response.status_code != 200:
+            if response:
+                logger.info("Feed HTTP %s: %s", response.status_code, feed_url)
             return []
         parsed = feedparser.parse(response.content)
         return parsed.entries[:POSTS_PER_FEED]
     except Exception as e:
         logger.warning("Feed error %s: %s", feed_url, e)
         return []
-
-
-# ============================================================
-# ARTICLE FETCHING
-# ============================================================
 
 ARTICLE_SELECTORS = [
     "article", "main", "[role='main']", ".article", ".article-content",
@@ -536,20 +553,19 @@ ARTICLE_SELECTORS = [
 
 STRIP_TAGS = ["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]
 
-
 def fetch_raw_html(url: str) -> Optional[str]:
     if not url or not is_safe_url(url):
         return None
     try:
-        response = HTTP.get(url, timeout=ARTICLE_TIMEOUT, allow_redirects=True)
-        if response.status_code != 200:
-            logger.info("Article HTTP %s: %s", response.status_code, url)
+        response = robust_get(url, ARTICLE_TIMEOUT)
+        if not response or response.status_code != 200:
+            if response:
+                logger.info("Article HTTP %s: %s", response.status_code, url)
             return None
         return response.text
     except Exception as e:
         logger.warning("Article fetch error for %s: %s", url, e)
         return None
-
 
 def extract_article_text(raw_html: Optional[str]) -> Optional[str]:
     if not raw_html:
@@ -607,7 +623,6 @@ def detect_source(entry: Any) -> str:
         return "WeChat"
     return ""
 
-
 def extract_original_link(fallback_url: str, *html_sources: Optional[str]) -> str:
     for source_html in html_sources:
         if not source_html:
@@ -621,7 +636,7 @@ def extract_original_link(fallback_url: str, *html_sources: Optional[str]) -> st
 
 
 # ============================================================
-# ENTRY ID
+# ENTRY ID & DATE
 # ============================================================
 
 def get_entry_id(entry: Any) -> Optional[str]:
@@ -636,11 +651,6 @@ def get_entry_id(entry: Any) -> Optional[str]:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return None
 
-
-# ============================================================
-# DATE
-# ============================================================
-
 def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
@@ -651,7 +661,6 @@ def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
         return -FUTURE_TOLERANCE <= age <= timedelta(days=max_age_days)
     except Exception:
         return False
-
 
 def entry_sort_key(entry: Any) -> datetime:
     p = entry.get("published_parsed") or entry.get("updated_parsed")
@@ -715,7 +724,6 @@ def call_gemini(model_name: str, prompt: str, max_tokens: int = 700) -> str:
         raise RuntimeError(f"Empty Gemini response (finish_reason={reason})")
     return text.strip()
 
-
 def call_model(provider: str, model: str, prompt: str, max_tokens: int = 700) -> str:
     if provider == "groq":
         return call_groq(model, prompt, max_tokens)
@@ -725,7 +733,7 @@ def call_model(provider: str, model: str, prompt: str, max_tokens: int = 700) ->
 
 
 # ============================================================
-# FILTER PROMPT / PARSER
+# FILTER & ANALYSIS LOGIC
 # ============================================================
 
 def build_filter_prompt(title: str, summary: str, source: str = "") -> str:
@@ -766,29 +774,22 @@ REJECT
 هیچ توضیح دیگری ننویس.
 """
 
-
 def parse_filter_result(result: Optional[str]) -> Optional[bool]:
     if not result:
         return None
-
     text = re.sub(r"```", "", result).strip().upper()
-
     stripped = text.strip(" .!\n\t")
     if stripped == "RELEVANT":
         return True
     if stripped == "REJECT":
         return False
-
     match = re.search(r"\b(RELEVANT|REJECT)\b", text)
     if match:
         return match.group(1) == "RELEVANT"
-
     return None
-
 
 def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
     prompt = build_filter_prompt(title, summary, source)
-    
     attempted_any = False
 
     for item in FILTER_MODELS:
@@ -824,10 +825,6 @@ def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
         raise NoModelsAvailable("No models available for filtering")
     return None
 
-
-# ============================================================
-# DEEP ANALYSIS PROMPT
-# ============================================================
 
 def build_analysis_prompt(title: str, article_text: str, link: str, source: str) -> str:
     if len(article_text) > 18000:
@@ -883,10 +880,8 @@ ARTICLE:
 {article_text}
 """
 
-
 def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optional[str]:
     prompt = build_analysis_prompt(title, article_text, link, source)
-    
     attempted_any = False
 
     for item in ANALYSIS_MODELS:
@@ -934,9 +929,6 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 
     source = detect_source(entry)
 
-    # --------------------------------------------------------
-    # Fetch article page (raw HTML kept around for link recovery)
-    # --------------------------------------------------------
     raw_html = None
     article_text = None
 
@@ -952,9 +944,6 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
         content_for_filter = rss_summary[:5000]
         logger.info("  [ARTICLE] Using RSS summary.")
 
-    # --------------------------------------------------------
-    # WeChat detection + original-link recovery
-    # --------------------------------------------------------
     is_wechat = bool(
         source
         or "weixin" in str(link).lower()
@@ -971,9 +960,6 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
             link = original_link
         logger.info("  [SOURCE] WeChat content detected.")
 
-    # --------------------------------------------------------
-    # FILTER
-    # --------------------------------------------------------
     decision = filter_article(title, content_for_filter, source)
 
     if decision is None:
@@ -986,9 +972,6 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 
     logger.info("  [RESULT] RELEVANT")
 
-    # --------------------------------------------------------
-    # Deep analysis
-    # --------------------------------------------------------
     if not article_text:
         article_text = rss_summary
 
@@ -1002,9 +985,6 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
         logger.info("  [RESULT] DEEP ANALYSIS FAILED")
         return {"status": "retry"}
 
-    # --------------------------------------------------------
-    # Telegram
-    # --------------------------------------------------------
     success = send_telegram(
         title=title,
         analysis=analysis,
@@ -1028,7 +1008,7 @@ def main() -> None:
     start = time.time()
 
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT")
+    logger.info("RSS SECURITY NEWS BOT (ULTIMATE EDITION)")
     logger.info("=" * 70)
 
     logger.info("Filter models: %s", [m["model"] for m in FILTER_MODELS])
@@ -1039,7 +1019,7 @@ def main() -> None:
     logger.info("GROQ_API_KEY: %s", "OK" if GROQ_API_KEY else "MISSING")
 
     if not gemini_client and not groq_client:
-        msg = "No AI provider configured (GROQ_API_KEY / GEMINI_API_KEY both missing)."
+        msg = "No AI provider configured."
         logger.error(msg)
         send_status_message(f"❌ {msg}")
         return
@@ -1063,9 +1043,6 @@ def main() -> None:
     seen_ids, retry_counts = load_state()
     logger.info("Previously seen: %d | Pending retries: %d", len(seen_ids), len(retry_counts))
 
-    # --------------------------------------------------------
-    # Download RSS (threaded)
-    # --------------------------------------------------------
     all_entries: List[Any] = []
     successful_feeds = 0
 
@@ -1083,9 +1060,6 @@ def main() -> None:
     logger.info("Successful feeds: %d/%d", successful_feeds, len(feeds))
     logger.info("Downloaded entries: %d", len(all_entries))
 
-    # --------------------------------------------------------
-    # Deduplicate
-    # --------------------------------------------------------
     candidates: List[Tuple[str, Any]] = []
     current_ids: Set[str] = set()
 
@@ -1124,14 +1098,10 @@ def main() -> None:
         f"▫️ تکراری: {skipped_seen + skipped_duplicate}"
     )
 
-    # Sort newest first, and defer the rest
     candidates.sort(key=lambda pair: entry_sort_key(pair[1]), reverse=True)
     deferred = candidates[MAX_ENTRIES_PER_RUN:]
     candidates = candidates[:MAX_ENTRIES_PER_RUN]
 
-    # --------------------------------------------------------
-    # Process sequentially (AI calls stay sequential to avoid rate limits)
-    # --------------------------------------------------------
     sent = rejected = failed = 0
     successfully_processed: Set[str] = set()
     total = len(candidates)
@@ -1169,16 +1139,12 @@ def main() -> None:
             successfully_processed.add(entry_id)
             retry_counts.pop(entry_id, None)
 
-        # Save state every 10 items incrementally
         if index % 10 == 0:
             seen_ids.update(successfully_processed)
             save_state(seen_ids, retry_counts)
 
         time.sleep(GEMINI_DELAY)
 
-    # --------------------------------------------------------
-    # Save state
-    # --------------------------------------------------------
     seen_ids.update(successfully_processed)
     save_state(seen_ids, retry_counts)
 
