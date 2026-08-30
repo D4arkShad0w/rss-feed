@@ -2,5 +2,7 @@ requests
 feedparser
 listparser
 beautifulsoup4
+urllib3
 google-genai
 groq
+httpx
