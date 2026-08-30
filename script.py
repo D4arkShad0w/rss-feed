@@ -1,12 +1,14 @@
 """
-RSS Security News Bot - Final Edition v7
+RSS Security News Bot - Final Edition v8
 ==========================================
 ۱. ETag + Thread-Local + 6-Layer fetch
-۲. Cleanup: فقط cap by size (50000) — بدون حذف by age → تکراری نمی‌شود
+۲. Cleanup: فقط cap by size (50000) — بدون حذف by age
 ۳. Markdown → HTML با پاک‌سازی ** اورفان
 ۴. Auto-Delete پیام‌های وضعیت بعد از ۲ دقیقه
-۵. link_preview_options با prefer_large_media (Instant View اگر سایت پشتیبانی کند)
-۶. Prompt: مطلقاً نام‌های خاص و لغات تخصصی ترجمه نشود
+۵. پیام "پایان" با sync_delete (اسکریپت صبر می‌کند تا پاک شود)
+۶. link_preview_options با prefer_large_media
+۷. Prompt: مطلقاً نام‌های خاص و لغات تخصصی ترجمه نشود
+۸. is_recent: بدون تاریخ → False (جلوگیری از تکرار)
 """
 
 from __future__ import annotations
@@ -81,7 +83,7 @@ TELEGRAM_MAX_LEN = 4096
 
 MAX_URL_VARIANTS = 10
 MAX_DISCOVERED_FEEDS = 5
-MAX_STATE_SIZE = 50000          # ✅ 50000 (بود 20000)
+MAX_STATE_SIZE = 50000
 
 AUTO_DELETE_DELAY = 120
 
@@ -367,7 +369,6 @@ def save_state(seen: Dict, retries: Dict, seen_urls: Dict,
     except Exception as e:
         logger.error("State save error: %s", e)
 
-# ✅ Cleanup: فقط cap by size — بدون حذف by age
 def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
                   seen_titles: Dict, etags: Dict
                   ) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
@@ -380,11 +381,9 @@ def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
             d = dict(sorted_items[:MAX_STATE_SIZE])
             logger.info("[CLEANUP] %s: capped to %d", name, MAX_STATE_SIZE)
         return d
-
     seen = cap_dict(seen, "seen")
     seen_urls = cap_dict(seen_urls, "seen_urls")
     seen_titles = cap_dict(seen_titles, "seen_titles")
-
     now = time.time()
     old_etags = [k for k, v in etags.items()
                  if now - v.get("last_fetch", 0) > 30 * 86400]
@@ -392,11 +391,9 @@ def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
         del etags[k]
     if old_etags:
         logger.info("[CLEANUP] etags: removed %d stale (kept %d)", len(old_etags), len(etags))
-
     if len(retries) > 500:
         sorted_r = sorted(retries.items(), key=lambda x: x[1], reverse=True)
         retries = dict(sorted_r[:200])
-
     return seen, retries, seen_urls, seen_titles, etags
 
 # ============================================================
@@ -449,17 +446,18 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 # ============================================================
-# TELEGRAM (با Auto-Delete + link_preview_options)
+# TELEGRAM (با Auto-Delete + sync_delete)
 # ============================================================
 
-def _post_telegram(payload: Dict[str, Any], auto_delete: bool = False) -> bool:
+def _post_telegram(payload: Dict[str, Any], auto_delete: bool = False,
+                   sync_delete: bool = False) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         response = get_http().post(url, json=payload, timeout=TELEGRAM_TIMEOUT)
         if response.ok:
-            if auto_delete:
+            if auto_delete or sync_delete:
                 try:
                     result = response.json()
                     message_id = result.get("result", {}).get("message_id")
@@ -467,7 +465,7 @@ def _post_telegram(payload: Dict[str, Any], auto_delete: bool = False) -> bool:
                         threading.Thread(
                             target=_delete_message_after_delay,
                             args=(message_id, AUTO_DELETE_DELAY),
-                            daemon=True
+                            daemon=not sync_delete
                         ).start()
                 except Exception:
                     pass
@@ -486,12 +484,12 @@ def _delete_message_after_delay(message_id: int, delay: int) -> None:
     except Exception as e:
         logger.warning("Auto-delete failed: %s", e)
 
-def send_status_message(text: str) -> bool:
+def send_status_message(text: str, sync_delete: bool = False) -> bool:
     if len(text) > 4000:
         text = text[:4000] + "\n... (Truncated)"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown",
                "disable_notification": True}
-    return _post_telegram(payload, auto_delete=True)
+    return _post_telegram(payload, auto_delete=True, sync_delete=sync_delete)
 
 def send_telegram(title: str, analysis: str, link: str, category: str, source: str = "") -> bool:
     if not BOT_TOKEN or not CHAT_ID:
@@ -516,7 +514,6 @@ def send_telegram(title: str, analysis: str, link: str, category: str, source: s
         trimmed = analysis_html[:max(0, len(analysis_html) - overflow)] + "…"
         text = build(trimmed)
 
-    # ✅ link_preview_options — preview بزرگ + Instant View اگر سایت پشتیبانی کند
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -817,13 +814,14 @@ def get_entry_id(entry: Any) -> Optional[str]:
 def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
-        return True
+        # ✅ بدون تاریخ → False (قدیمی فرض کن → تکرار نمی‌شود)
+        return False
     try:
         date = datetime(*parsed[:6], tzinfo=timezone.utc)
         age = datetime.now(timezone.utc) - date
         return -FUTURE_TOLERANCE <= age <= timedelta(days=max_age_days)
     except Exception:
-        return True
+        return False
 
 def entry_sort_key(entry: Any) -> datetime:
     p = entry.get("published_parsed") or entry.get("updated_parsed")
@@ -1033,7 +1031,7 @@ TITLE_FA: [عنوان ترجمه‌شده به فارسی]
 2. برای تأکید و لغات تخصصی از **bold** استفاده کن. مثلاً:
    - **EDR Bypass** و **Zero-Day** و **Heap Overflow** و **Kernel Mode**
 3. برای نام فایل، تابع، کلاس، دستور، متغیر از `inline code` استفاده کن. مثلاً:
-   - `maxJsonLength` و `ArrayList` و `C:\\Windows\\System32` و `NtCreateFile`
+   - `maxJsonLength` و `ArrayList` و `C:\\\\Windows\\\\System32` و `NtCreateFile`
 4. برای بلوک‌های کد طولانی از ``` استفاده کن.
 5. برای تأکید ملایم و اصطلاحات فرعی از *italic* استفاده کن. مثلاً:
    - *به نظر می‌رسد* و *احتمالاً* و *مهاجم*
@@ -1177,7 +1175,7 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 def main() -> None:
     start = time.time()
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v7)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v8)")
     logger.info("=" * 70)
     logger.info("BOT_TOKEN: %s", "OK" if BOT_TOKEN else "MISSING")
     logger.info("GROQ_API_KEY: %s", "OK" if GROQ_API_KEY else "MISSING")
@@ -1367,7 +1365,8 @@ def main() -> None:
         f"▫️ ناموفق: {failed}\n"
         f"▫️ State: {len(seen)} IDs | {len(etags)} etags"
     )
-    send_status_message(finish_msg)
+    # ✅ sync_delete=True — اسکریپت صبر می‌کند تا پیام پاک شود
+    send_status_message(finish_msg, sync_delete=True)
 
 # ============================================================
 # ENTRY POINT
