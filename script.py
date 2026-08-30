@@ -1,12 +1,12 @@
 """
-RSS Security News Bot - Final Edition v6
+RSS Security News Bot - Final Edition v7
 ==========================================
-۱. ETag/Last-Modified — Conditional GET (304 = بدون محتوا، سریع)
-۲. FEED_TIMEOUT=15 + MAX_WORKERS=8 — سریع‌تر ولی پایدار
-۳. State Cleanup — حذف entries قدیمی، cap حجم
-۴. Markdown → HTML با پاک‌سازی ** اورفان
-۵. Auto-Delete پیام‌های وضعیت بعد از ۲ دقیقه
-۶. بدون پیام "شروع"
+۱. ETag + Thread-Local + 6-Layer fetch
+۲. Cleanup: فقط cap by size (50000) — بدون حذف by age → تکراری نمی‌شود
+۳. Markdown → HTML با پاک‌سازی ** اورفان
+۴. Auto-Delete پیام‌های وضعیت بعد از ۲ دقیقه
+۵. link_preview_options با prefer_large_media (Instant View اگر سایت پشتیبانی کند)
+۶. Prompt: مطلقاً نام‌های خاص و لغات تخصصی ترجمه نشود
 """
 
 from __future__ import annotations
@@ -81,9 +81,9 @@ TELEGRAM_MAX_LEN = 4096
 
 MAX_URL_VARIANTS = 10
 MAX_DISCOVERED_FEEDS = 5
-MAX_STATE_SIZE = 20000
+MAX_STATE_SIZE = 50000          # ✅ 50000 (بود 20000)
 
-AUTO_DELETE_DELAY = 120  # ✅ ۲ دقیقه
+AUTO_DELETE_DELAY = 120
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -367,18 +367,11 @@ def save_state(seen: Dict, retries: Dict, seen_urls: Dict,
     except Exception as e:
         logger.error("State save error: %s", e)
 
+# ✅ Cleanup: فقط cap by size — بدون حذف by age
 def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
                   seen_titles: Dict, etags: Dict
                   ) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
-    now = time.time()
-    max_age = (MAX_AGE_DAYS * 2) * 86400
-
-    def clean_dict(d: Dict, name: str) -> Dict:
-        old = [k for k, v in d.items() if isinstance(v, (int, float)) and now - v > max_age]
-        for k in old:
-            del d[k]
-        if old:
-            logger.info("[CLEANUP] %s: removed %d old (kept %d)", name, len(old), len(d))
+    def cap_dict(d: Dict, name: str) -> Dict:
         if len(d) > MAX_STATE_SIZE:
             if all(isinstance(v, (int, float)) for v in d.values()):
                 sorted_items = sorted(d.items(), key=lambda x: x[1], reverse=True)
@@ -388,16 +381,17 @@ def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
             logger.info("[CLEANUP] %s: capped to %d", name, MAX_STATE_SIZE)
         return d
 
-    seen = clean_dict(seen, "seen")
-    seen_urls = clean_dict(seen_urls, "seen_urls")
-    seen_titles = clean_dict(seen_titles, "seen_titles")
+    seen = cap_dict(seen, "seen")
+    seen_urls = cap_dict(seen_urls, "seen_urls")
+    seen_titles = cap_dict(seen_titles, "seen_titles")
 
+    now = time.time()
     old_etags = [k for k, v in etags.items()
                  if now - v.get("last_fetch", 0) > 30 * 86400]
     for k in old_etags:
         del etags[k]
     if old_etags:
-        logger.info("[CLEANUP] etags: removed %d old (kept %d)", len(old_etags), len(etags))
+        logger.info("[CLEANUP] etags: removed %d stale (kept %d)", len(old_etags), len(etags))
 
     if len(retries) > 500:
         sorted_r = sorted(retries.items(), key=lambda x: x[1], reverse=True)
@@ -437,7 +431,6 @@ def markdown_to_html(text: str) -> str:
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # ✅ پاک‌سازی ** و * اورفان
     text = text.replace("**", "")
     text = re.sub(r"(?<!\w)\*(?!\d)", "", text)
     return text.strip()
@@ -456,7 +449,7 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 # ============================================================
-# TELEGRAM (با Auto-Delete)
+# TELEGRAM (با Auto-Delete + link_preview_options)
 # ============================================================
 
 def _post_telegram(payload: Dict[str, Any], auto_delete: bool = False) -> bool:
@@ -496,7 +489,8 @@ def _delete_message_after_delay(message_id: int, delay: int) -> None:
 def send_status_message(text: str) -> bool:
     if len(text) > 4000:
         text = text[:4000] + "\n... (Truncated)"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_notification": True}
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown",
+               "disable_notification": True}
     return _post_telegram(payload, auto_delete=True)
 
 def send_telegram(title: str, analysis: str, link: str, category: str, source: str = "") -> bool:
@@ -522,7 +516,17 @@ def send_telegram(title: str, analysis: str, link: str, category: str, source: s
         trimmed = analysis_html[:max(0, len(analysis_html) - overflow)] + "…"
         text = build(trimmed)
 
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
+    # ✅ link_preview_options — preview بزرگ + Instant View اگر سایت پشتیبانی کند
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "link_preview_options": {
+            "is_disabled": False,
+            "prefer_large_media": True,
+            "show_above_text": False,
+        },
+    }
     ok = _post_telegram(payload, auto_delete=False)
     if ok:
         logger.info("Telegram message sent.")
@@ -637,7 +641,7 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
     return entries[:POSTS_PER_FEED]
 
 # ============================================================
-# FEED FETCH — با ETag + Retry
+# FEED FETCH
 # ============================================================
 
 ARTICLE_SELECTORS = [
@@ -663,42 +667,34 @@ def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
     hostname = parsed.netloc.split(":")[0]
     if not check_dns(hostname):
         return [], False
-
     etag_data = etags.get(url, {})
     extra_headers = {}
     if etag_data.get("etag"):
         extra_headers["If-None-Match"] = etag_data["etag"]
     if etag_data.get("last_modified"):
         extra_headers["If-Modified-Since"] = etag_data["last_modified"]
-
     response = fetch_url(url, FEED_TIMEOUT,
                         extra_headers=extra_headers if extra_headers else None,
                         allow_304=True)
-
     if not response:
         return [], False
-
     if response.status_code == 304:
         logger.info("  [FEED] 304 Not Modified: %s", url)
         if url in etags:
             etags[url]["last_fetch"] = time.time()
         return [], False
-
     if response.status_code == 200:
         new_etag = response.headers.get("ETag")
         new_lm = response.headers.get("Last-Modified")
         etags[url] = {"etag": new_etag, "last_modified": new_lm, "last_fetch": time.time()}
-
     parsed_feed = feedparser.parse(response.content)
     if parsed_feed.entries:
         logger.info("  [FEED] ✅ feedparser: %d entries: %s", len(parsed_feed.entries), url)
         return parsed_feed.entries[:POSTS_PER_FEED], True
-
     content_preview = response.text[:500].strip()
     is_xml = any(tag in content_preview.lower() for tag in ["<?xml", "<rss", "<feed", "<channel", "<entry"])
     if is_xml:
         return [], False
-
     discovered = discover_rss_feeds(response.text, url)
     for rss_url in discovered:
         if normalize_url(rss_url) == normalize_url(url):
@@ -709,11 +705,9 @@ def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
             if rss_parsed.entries:
                 logger.info("  [DISCOVERY] ✅ Found RSS: %s", rss_url)
                 return rss_parsed.entries[:POSTS_PER_FEED], True
-
     scraped = scrape_site_articles(response.text, url)
     if scraped:
         return scraped[:POSTS_PER_FEED], True
-
     return [], False
 
 def fetch_single_feed(feed: Any, etags: Dict) -> Tuple[List[Any], bool]:
@@ -731,7 +725,6 @@ def fetch_single_feed(feed: Any, etags: Dict) -> Tuple[List[Any], bool]:
             elif attempt == 0:
                 logger.info("  [FEED] Retry in 2s: %s", feed_url)
                 time.sleep(2)
-
         variants = generate_url_variants(feed_url)
         for variant_url in variants:
             entries, _ = try_fetch_feed_url(variant_url, etags)
@@ -739,7 +732,6 @@ def fetch_single_feed(feed: Any, etags: Dict) -> Tuple[List[Any], bool]:
                 entries = filter_entries_by_date(entries)
                 logger.info("  [FEED] ✅ Variant: %s", variant_url)
                 return entries[:POSTS_PER_FEED], True
-
         return [], False
     except Exception as e:
         logger.warning("Feed error %s: %s", feed_url, e)
@@ -971,9 +963,39 @@ def build_analysis_prompt(title: str, article_text: str, link: str, source: str)
 وظایف:
 
 ۱. ابتدا عنوان این مطلب را به فارسی ترجمه کن.
-   - لغات تخصصی امنیتی و کامپیوتری (مانند EDR, APT, CVE, RCE, XSS, Buffer Overflow, Use-After-Free, Kernel, UEFI, Rootkit, PatchGuard, PPL, VBS, AMSI) را به انگلیسی نگه دار.
-   - نام‌های خاص (مانند Black Hat, DEF CON, Windows, Linux, Google, Microsoft, Intel, AMD) را به انگلیسی نگه دار.
-   - برای اصطلاحات عمومی معادل فارسی استفاده کن.
+
+قوانین ترجمه عنوان (مطلقاً رعایت کن):
+- نام کنفرانس‌ها و رویدادها را مطلقاً ترجمه نکن:
+  * Black Hat → Black Hat (نه کلاه سیاه!)
+  * DEF CON → DEF CON (نه دف کان!)
+  * USENIX Security → USENIX Security
+  * NDSS → NDSS
+  * IEEE S&P → IEEE S&P
+  * Pwn2Own → Pwn2Own
+- نام شرکت‌ها و محصولات را مطلقاً ترجمه نکن:
+  * Windows → Windows (نه ویندوز!)
+  * Linux → Linux
+  * Google → Google
+  * Microsoft → Microsoft
+  * Intel → Intel
+  * CrowdStrike → CrowdStrike
+  * SentinelOne → SentinelOne
+- نام افراد را مطلقاً ترجمه نکن:
+  * Schneier → Schneier
+  * Halvar Flake → Halvar Flake
+- لغات تخصصی امنیتی را مطلقاً ترجمه نکن:
+  * Exploit → Exploit (نه سوءاستفاده!)
+  * Payload → Payload
+  * Shellcode → Shellcode
+  * Buffer Overflow → Buffer Overflow
+  * Use-After-Free → Use-After-Free
+  * Heap Spraying → Heap Spraying
+  * Kernel Mode → Kernel Mode
+  * EDR Bypass → EDR Bypass
+  * Zero-Day → Zero-Day
+  * RCE → RCE
+  * Privilege Escalation → Privilege Escalation
+- فقط کلمات عمومی فارسی را ترجمه کن: the, is, using, new, analysis, etc.
 
 ۲. سپس تحلیل ۱۰ تا ۱۵ خطی فارسی بنویس.
 
@@ -1003,7 +1025,7 @@ TITLE_FA: [عنوان ترجمه‌شده به فارسی]
 2. اطلاعات عمومی خودت را به جای محتوای مقاله قرار نده.
 3. اگر متن ناقص است، صریحاً بگو.
 4. عنوان انگلیسی را دوباره کپی نکن — فقط نسخه‌ی ترجمه‌شده بده.
-5. خروجی فقط فارسی باشد (به جز لغات تخصصی انگلیسی).
+5. خروجی فقط فارسی باشد (به جز لغات تخصصی و نام‌های خاص انگلیسی).
 6. حدود ۱۰ تا ۱۵ خط بنویس.
 
 قوانین قالب‌بندی (بسیار مهم):
@@ -1020,7 +1042,7 @@ TITLE_FA: [عنوان ترجمه‌شده به فارسی]
 8. از bullet point (-) و شماره‌گذاری استفاده نکن — متن پیوسته تحلیلی بنویس.
 9. از علامت‌های « » استفاده نکن — از " " استفاده کن.
 10. از — استفاده نکن — از - استفاده کن.
-11. لغات تخصصی انگلیسی را داخل **bold** بگذار تا متمایز شوند.
+11. لغات تخصصی انگلیسی و نام‌های خاص را داخل **bold** بگذار تا متمایز شوند. مثلاً **Black Hat** و **Use-After-Free**.
 
 TITLE:
 {title}
@@ -1155,7 +1177,7 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 def main() -> None:
     start = time.time()
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v6)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v7)")
     logger.info("=" * 70)
     logger.info("BOT_TOKEN: %s", "OK" if BOT_TOKEN else "MISSING")
     logger.info("GROQ_API_KEY: %s", "OK" if GROQ_API_KEY else "MISSING")
@@ -1186,8 +1208,6 @@ def main() -> None:
     )
     logger.info("State: %d IDs | %d URLs | %d titles | %d etags | %d retries",
                 len(seen), len(seen_urls), len(seen_titles), len(etags), len(retry_counts))
-
-    # ✅ بدون پیام "شروع" — مستقیماً fetch شروع می‌شود
 
     all_entries: List[Any] = []
     successful_feeds = 0
@@ -1228,7 +1248,6 @@ def main() -> None:
         if entry_id in current_ids:
             skipped_duplicate += 1
             continue
-
         link = entry.get("link", "")
         norm_link = normalize_url(link) if link else ""
         if norm_link:
@@ -1236,7 +1255,6 @@ def main() -> None:
                 skipped_duplicate += 1
                 continue
             current_urls.add(norm_link)
-
         title = clean_html(entry.get("title", ""))
         title_hash = hashlib.sha256(title.lower().strip().encode("utf-8")).hexdigest() if title else ""
         if title_hash:
@@ -1244,13 +1262,11 @@ def main() -> None:
                 skipped_duplicate += 1
                 continue
             current_titles.add(title_hash)
-
         if not is_recent(entry):
             skipped_old += 1
             seen[entry_id] = time.time()
             retry_counts.pop(entry_id, None)
             continue
-
         current_ids.add(entry_id)
         candidates.append((entry_id, entry))
 
