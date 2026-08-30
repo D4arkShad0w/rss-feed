@@ -6,3 +6,4 @@ urllib3
 google-genai
 groq
 httpx
+cloudscraper
