@@ -1,17 +1,12 @@
 """
-RSS Security News Bot - Final Edition v2
+RSS Security News Bot - Final Edition v3
 ==========================================
-- Groq SDK رسمی (بدون http_client سفارشی)
-- .strip() روی همه‌ی API Keys
+- POSTS_PER_FEED = 100 (برای unsafe.sh و فیدهای پرحجم)
+- MAX_UNDATED_ENTRIES_PER_FEED = 3 (محدود کردن فیدهای بدون تاریخ مثل Digital Whisper)
+- Groq SDK رسمی + Thread-Local Session
 - 6-Layer fetch: requests → curl_cffi(×4) → verify=False
-- Thread-Local Session (thread-safe)
-- build_session با هدرهای ساده
-- Smart URL Variants + RSS Discovery + Site Scraping
-- Triple Dedup: entry_id + normalized URL + title hash
-- Title Translation: فارسی با حفظ لغات تخصصی
-- Markdown → HTML conversion برای نمایش درست در تلگرام
-- MAX_ENTRIES_PER_RUN = 100
-- MAX_WORKERS = 5
+- Markdown → HTML برای نمایش درست در تلگرام
+- Triple Dedup + Title Translation + Smart URL Variants
 """
 
 from __future__ import annotations
@@ -68,11 +63,12 @@ OPML_FILE = "feeds.opml"
 STATE_FILE = "seen_ids.json"
 
 MAX_WORKERS = 5
-POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "50"))
+POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "100"))       # ✅ 100 برای unsafe.sh
+MAX_UNDATED_ENTRIES_PER_FEED = 3                                  # ✅ محدود کردن فیدهای بدون تاریخ
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
 FUTURE_TOLERANCE = timedelta(hours=6)
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "60"))
+MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "100"))
 
 FEED_TIMEOUT = 30
 ARTICLE_TIMEOUT = 35
@@ -204,7 +200,6 @@ def build_session() -> requests.Session:
     session.mount("https://", adapter)
     return session
 
-# ✅ Thread-Local Session — هر thread یک session مستقل دارد
 _thread_local = threading.local()
 
 def get_http() -> requests.Session:
@@ -240,12 +235,9 @@ def normalize_url(url: str) -> str:
     except Exception:
         return url
 
-# ✅ 6-Layer fetch — Thread-Safe
+# ✅ 6-Layer fetch
 def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
-    """6-Layer: requests → curl_cffi(×4) → verify=False"""
     http = get_http()
-
-    # Layer 1: requests
     try:
         response = http.get(url, timeout=timeout, allow_redirects=True)
         if response.status_code == 200:
@@ -259,7 +251,6 @@ def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
         else:
             logger.info("  [HTTP] requests failed: %s | %s", url, error_msg[:100])
 
-    # Layer 2-5: curl_cffi با 4 impersonation
     for imp in ["chrome", "chrome120", "safari", "edge"]:
         try:
             response = cffi_requests.get(url, impersonate=imp, timeout=timeout, allow_redirects=True)
@@ -269,7 +260,6 @@ def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
         except Exception:
             continue
 
-    # Layer 6: verify=False
     try:
         response = http.get(url, timeout=timeout, allow_redirects=True, verify=False)
         if response.status_code == 200:
@@ -356,33 +346,20 @@ def escape_html_text(text: Any) -> str:
         return ""
     return html.escape(str(text), quote=False)
 
-# ✅ Markdown → HTML برای تلگرام
 def markdown_to_html(text: str) -> str:
-    """Markdown را به HTML تلگرام تبدیل کن.
-    حتماً بعد از escape_html_text صدا زده شود.
-    """
     if not text:
         return ""
-    # Code blocks: ```lang\ntext``` → <pre>text</pre>
     text = re.sub(r"```[\w]*\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
-    # Inline code: `text` → <code>text</code>
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
-    # Bold: **text** → <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    # Bold: __text__ → <b>text</b>
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-    # Italic: *text* → <i>text</i> (بدون false positive برای *)
     text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
-    # Headers: # text → <b>text</b>
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-    # Clean whitespace
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# ✅ برای عنوان — Markdown را کامل حذف کن
 def strip_markdown(text: str) -> str:
-    """Markdown markers را کامل حذف کن — برای عنوان."""
     if not text:
         return ""
     text = re.sub(r"```[\w]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
@@ -419,15 +396,10 @@ def send_status_message(text: str) -> bool:
 def send_telegram(title: str, analysis: str, link: str, category: str, source: str = "") -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         return False
-
-    # ✅ عنوان: Markdown حذف شود → escape HTML
     title_clean = strip_markdown(title)
     title_e = escape_html_text(title_clean)
-
-    # ✅ تحلیل: escape HTML → Markdown به HTML
     analysis_escaped = escape_html_text(analysis)
     analysis_html = markdown_to_html(analysis_escaped)
-
     category_e = escape_html_text(category)
     source_e = escape_html_text(source)
     if not is_safe_url(link):
@@ -462,40 +434,31 @@ def generate_url_variants(url: str) -> List[str]:
 
     if "sympoium" in url:
         variants.append(url.replace("sympoium", "symposium"))
-
     if "rsshub.app" in url:
         for alt in ["rsshub.rssforever.com", "rss.shab.fun", "rsshub.feeded.xyz"]:
             variants.append(url.replace("rsshub.app", alt))
-
     if "wordpress.com" in parsed.netloc or path.endswith(".php"):
         for p in ["?format=xml", "?feed=rss2", "?feed=atom"]:
             sep = "&" if "?" in url else "?"
             variants.append(url + (p.replace("?", sep) if sep == "&" else p))
-
     if "alt=rss" in url:
         variants.append(url.replace("?alt=rss", "").replace("&alt=rss", "").rstrip("?"))
-
     if not path.endswith("/feed") and not path.endswith(".xml"):
         variants.append(base + path + "/feed/")
         variants.append(base + path + "/rss/")
-
     if path in ["", "/", "/index.php", "/index.html", "/blog"]:
         for p in ["/feed", "/feed/", "/rss", "/rss.xml", "/atom.xml",
                   "/index.xml", "/feed.xml", "/?feed=rss2", "/blog/feed"]:
             variants.append(base + p)
-
     if parsed.scheme == "https":
         variants.append(url.replace("https://", "http://", 1))
-
     if not parsed.netloc.startswith("www."):
         variants.append(url.replace(f"://{parsed.netloc}", f"://www.{parsed.netloc}", 1))
     if parsed.netloc.startswith("www."):
         variants.append(url.replace("://www.", "://", 1))
-
     if path.endswith(".xml"):
         variants.append(base + path[:-4])
         variants.append(base + path.replace(".xml", ".rss"))
-
     if "/archive/" in path:
         variants.append(base + "/feed/")
 
@@ -653,6 +616,23 @@ def try_fetch_feed_url(url: str) -> List[Any]:
         return scraped[:POSTS_PER_FEED]
     return []
 
+# ✅ filter_entries — محدود کردن entries بدون تاریخ
+def filter_entries_by_date(entries: List[Any]) -> List[Any]:
+    """entries با تاریخ را نگه دار، entries بدون تاریخ را به MAX_UNDATED محدود کن."""
+    dated = []
+    undated = []
+    for e in entries:
+        if e.get("published_parsed") or e.get("updated_parsed"):
+            dated.append(e)
+        else:
+            undated.append(e)
+
+    if len(undated) > MAX_UNDATED_ENTRIES_PER_FEED:
+        logger.info("  [FEED] Limiting %d undated → %d", len(undated), MAX_UNDATED_ENTRIES_PER_FEED)
+        undated = undated[:MAX_UNDATED_ENTRIES_PER_FEED]
+
+    return dated + undated
+
 def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
     feed_url = feed.get("url") if isinstance(feed, dict) else getattr(feed, "url", None)
     if not feed_url or not is_safe_url(feed_url):
@@ -660,15 +640,20 @@ def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
     try:
         entries = try_fetch_feed_url(feed_url)
         if entries:
-            return entries, True
+            # ✅ محدود کردن entries بدون تاریخ
+            entries = filter_entries_by_date(entries)
+            return entries[:POSTS_PER_FEED], True
+
         variants = generate_url_variants(feed_url)
         if variants:
             logger.info("  [FEED] Original failed, trying %d variants for %s", len(variants), feed_url)
         for variant_url in variants:
             entries = try_fetch_feed_url(variant_url)
             if entries:
+                entries = filter_entries_by_date(entries)
                 logger.info("  [FEED] ✅ Variant succeeded: %s", variant_url)
-                return entries, True
+                return entries[:POSTS_PER_FEED], True
+
         return [], False
     except Exception as e:
         logger.warning("Feed error %s: %s", feed_url, e)
@@ -963,7 +948,6 @@ ARTICLE:
 def parse_analysis_response(response: str) -> Tuple[str, str]:
     title_fa = ""
     analysis = response.strip()
-
     match = re.search(r'TITLE_FA:\s*(.+?)(?:\n---|\n\n|\nANALYSIS:)', response, re.DOTALL | re.IGNORECASE)
     if match:
         title_fa = match.group(1).strip()
@@ -975,7 +959,6 @@ def parse_analysis_response(response: str) -> Tuple[str, str]:
         if lines and lines[0].strip().startswith('TITLE_FA:'):
             title_fa = lines[0].replace('TITLE_FA:', '').strip()
             analysis = '\n'.join(lines[1:]).strip()
-
     return title_fa, analysis
 
 def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optional[Tuple[str, str]]:
@@ -1082,7 +1065,7 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 def main() -> None:
     start = time.time()
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v2)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v3)")
     logger.info("=" * 70)
     logger.info("Filter models: %s", [m["model"] for m in FILTER_MODELS])
     logger.info("Analysis models: %s", [m["model"] for m in ANALYSIS_MODELS])
