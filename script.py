@@ -1,12 +1,14 @@
 """
-RSS Security News Bot - Final Edition v3
+RSS Security News Bot - Final Edition v4
 ==========================================
-- POSTS_PER_FEED = 100 (برای unsafe.sh و فیدهای پرحجم)
-- MAX_UNDATED_ENTRIES_PER_FEED = 3 (محدود کردن فیدهای بدون تاریخ مثل Digital Whisper)
-- Groq SDK رسمی + Thread-Local Session
+- POSTS_PER_FEED = 100, MAX_ENTRIES_PER_RUN = 100
+- MAX_UNDATED_ENTRIES_PER_FEED = 3 (محدود کردن Digital Whisper)
+- DNS Cache + Retry برای پایداری unsafe.sh و IEEE
+- Thread-Local Session + MAX_WORKERS = 5
 - 6-Layer fetch: requests → curl_cffi(×4) → verify=False
-- Markdown → HTML برای نمایش درست در تلگرام
+- Markdown → HTML با پشتیبانی کامل: bold, italic, code, pre
 - Triple Dedup + Title Translation + Smart URL Variants
+- Groq SDK رسمی + .strip() روی همه‌ی API Keys
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import html
 import json
 import os
 import re
+import socket
 import threading
 import time
 import warnings
@@ -63,8 +66,8 @@ OPML_FILE = "feeds.opml"
 STATE_FILE = "seen_ids.json"
 
 MAX_WORKERS = 5
-POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "100"))       # ✅ 100 برای unsafe.sh
-MAX_UNDATED_ENTRIES_PER_FEED = 3                                  # ✅ محدود کردن فیدهای بدون تاریخ
+POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "100"))
+MAX_UNDATED_ENTRIES_PER_FEED = 3
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
 FUTURE_TOLERANCE = timedelta(hours=6)
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
@@ -180,7 +183,7 @@ def build_interests_prompt() -> str:
 INTERESTS_PROMPT = build_interests_prompt()
 
 # ============================================================
-# HTTP SESSION (Thread-Local)
+# HTTP SESSION (Thread-Local) + DNS CACHE
 # ============================================================
 
 def build_session() -> requests.Session:
@@ -235,6 +238,24 @@ def normalize_url(url: str) -> str:
     except Exception:
         return url
 
+# ✅ DNS Cache
+_dns_cache: Dict[str, Tuple[float, int]] = {}
+_dns_cache_ttl = 300
+
+def check_dns(hostname: str) -> bool:
+    now = time.time()
+    cached = _dns_cache.get(hostname)
+    if cached and (now - cached[0]) < _dns_cache_ttl:
+        return True
+    try:
+        socket.setdefaulttimeout(5)
+        socket.gethostbyname(hostname)
+        _dns_cache[hostname] = (now, _dns_cache_ttl)
+        return True
+    except Exception:
+        logger.warning("  [DNS] Failed to resolve: %s", hostname)
+        return False
+
 # ✅ 6-Layer fetch
 def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
     http = get_http()
@@ -250,7 +271,6 @@ def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
             logger.info("  [HTTP] SSL Error → will bypass: %s", url)
         else:
             logger.info("  [HTTP] requests failed: %s | %s", url, error_msg[:100])
-
     for imp in ["chrome", "chrome120", "safari", "edge"]:
         try:
             response = cffi_requests.get(url, impersonate=imp, timeout=timeout, allow_redirects=True)
@@ -259,7 +279,6 @@ def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
                 return response
         except Exception:
             continue
-
     try:
         response = http.get(url, timeout=timeout, allow_redirects=True, verify=False)
         if response.status_code == 200:
@@ -268,7 +287,6 @@ def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
         logger.warning("[FETCH] %s | HTTP %d | verify=False", url, response.status_code)
     except Exception as e:
         logger.warning("[FETCH] %s | ALL methods failed | %s", url, str(e)[:100])
-
     return None
 
 # ============================================================
@@ -346,15 +364,28 @@ def escape_html_text(text: Any) -> str:
         return ""
     return html.escape(str(text), quote=False)
 
+# ✅ Markdown → HTML کامل برای تلگرام
 def markdown_to_html(text: str) -> str:
+    """Markdown را به HTML تلگرام تبدیل کن.
+    حتماً بعد از escape_html_text صدا زده شود.
+    """
     if not text:
         return ""
+    # Code blocks: ```lang\ntext``` → <pre>text</pre>
     text = re.sub(r"```[\w]*\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
+    # Inline code: `text` → <code>text</code>
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    # Bold: **text** → <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # Bold: __text__ → <b>text</b>
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+    # Italic: *text* → <i>text</i>
     text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
+    # Italic: _text_ → <i>text</i> (فقط کلمات بدون space)
+    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"<i>\1</i>", text)
+    # Headers: # text → <b>text</b>
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+    # Clean whitespace
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -367,6 +398,7 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"__(.+?)__", r"\1", text)
     text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"\1", text)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     return text.strip()
 
@@ -579,7 +611,7 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
     return entries[:POSTS_PER_FEED]
 
 # ============================================================
-# FEED FETCH
+# FEED FETCH — با DNS Cache + Retry + logging دقیق
 # ============================================================
 
 ARTICLE_SELECTORS = [
@@ -588,19 +620,49 @@ ARTICLE_SELECTORS = [
 ]
 STRIP_TAGS = ["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]
 
+def filter_entries_by_date(entries: List[Any]) -> List[Any]:
+    dated = []
+    undated = []
+    for e in entries:
+        if e.get("published_parsed") or e.get("updated_parsed"):
+            dated.append(e)
+        else:
+            undated.append(e)
+    if len(undated) > MAX_UNDATED_ENTRIES_PER_FEED:
+        logger.info("  [FEED] Limiting %d undated → %d", len(undated), MAX_UNDATED_ENTRIES_PER_FEED)
+        undated = undated[:MAX_UNDATED_ENTRIES_PER_FEED]
+    return dated + undated
+
 def try_fetch_feed_url(url: str) -> List[Any]:
+    # ✅ DNS pre-check
+    parsed = urlparse(url)
+    hostname = parsed.netloc.split(":")[0]
+    if not check_dns(hostname):
+        return []
+
     response = fetch_url(url, FEED_TIMEOUT)
     if not response:
+        logger.info("  [FEED] fetch_url returned None: %s", url)
         return []
-    parsed = feedparser.parse(response.content)
-    if parsed.entries:
-        logger.info("  [FEED] ✅ feedparser: %d entries: %s", len(parsed.entries), url)
-        return parsed.entries[:POSTS_PER_FEED]
+
+    parsed_feed = feedparser.parse(response.content)
+    if parsed_feed.entries:
+        logger.info("  [FEED] ✅ feedparser: %d entries: %s", len(parsed_feed.entries), url)
+        return parsed_feed.entries[:POSTS_PER_FEED]
+
+    ct = response.headers.get("content-type", "unknown")
+    preview = response.text[:300].replace("\n", " ").replace("\r", "")
+    logger.info("  [FEED] 0 entries | CT: %s | %d bytes | Preview: %s", ct[:30], len(response.content), preview[:100])
+
     content_preview = response.text[:500].strip()
     is_xml = any(tag in content_preview.lower() for tag in ["<?xml", "<rss", "<feed", "<channel", "<entry"])
     if is_xml:
-        logger.warning("  [FEED] XML detected but 0 entries: %s", url)
+        if parsed_feed.bozo:
+            logger.warning("  [FEED] XML but bozo: %s | %s", url, str(parsed_feed.bozo_exception)[:150])
+        else:
+            logger.warning("  [FEED] XML but 0 entries: %s", url)
         return []
+
     discovered = discover_rss_feeds(response.text, url)
     for rss_url in discovered:
         if normalize_url(rss_url) == normalize_url(url):
@@ -611,42 +673,31 @@ def try_fetch_feed_url(url: str) -> List[Any]:
             if rss_parsed.entries:
                 logger.info("  [DISCOVERY] ✅ Found RSS: %s (%d entries)", rss_url, len(rss_parsed.entries))
                 return rss_parsed.entries[:POSTS_PER_FEED]
+
     scraped = scrape_site_articles(response.text, url)
     if scraped:
         return scraped[:POSTS_PER_FEED]
     return []
-
-# ✅ filter_entries — محدود کردن entries بدون تاریخ
-def filter_entries_by_date(entries: List[Any]) -> List[Any]:
-    """entries با تاریخ را نگه دار، entries بدون تاریخ را به MAX_UNDATED محدود کن."""
-    dated = []
-    undated = []
-    for e in entries:
-        if e.get("published_parsed") or e.get("updated_parsed"):
-            dated.append(e)
-        else:
-            undated.append(e)
-
-    if len(undated) > MAX_UNDATED_ENTRIES_PER_FEED:
-        logger.info("  [FEED] Limiting %d undated → %d", len(undated), MAX_UNDATED_ENTRIES_PER_FEED)
-        undated = undated[:MAX_UNDATED_ENTRIES_PER_FEED]
-
-    return dated + undated
 
 def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
     feed_url = feed.get("url") if isinstance(feed, dict) else getattr(feed, "url", None)
     if not feed_url or not is_safe_url(feed_url):
         return [], False
     try:
-        entries = try_fetch_feed_url(feed_url)
-        if entries:
-            # ✅ محدود کردن entries بدون تاریخ
-            entries = filter_entries_by_date(entries)
-            return entries[:POSTS_PER_FEED], True
+        # ✅ Retry: ۲ بار URL اصلی را امتحان کن
+        for attempt in range(2):
+            entries = try_fetch_feed_url(feed_url)
+            if entries:
+                entries = filter_entries_by_date(entries)
+                return entries[:POSTS_PER_FEED], True
+            if attempt == 0:
+                logger.info("  [FEED] Retry in 3s: %s", feed_url)
+                time.sleep(3)
 
+        # ✅ URL Variants
         variants = generate_url_variants(feed_url)
         if variants:
-            logger.info("  [FEED] Original failed, trying %d variants for %s", len(variants), feed_url)
+            logger.info("  [FEED] Trying %d variants for %s", len(variants), feed_url)
         for variant_url in variants:
             entries = try_fetch_feed_url(variant_url)
             if entries:
@@ -921,16 +972,20 @@ TITLE_FA: [عنوان ترجمه‌شده به فارسی]
 6. حدود ۱۰ تا ۱۵ خط بنویس.
 
 قوانین قالب‌بندی (بسیار مهم):
-1. از Markdown استاندارد استفاده کن — این Markdown در تلگرام به HTML تبدیل می‌شود.
-2. برای تأکید و لغات تخصصی از **bold** استفاده کن — مثلاً **EDR Bypass** یا **Zero-Day**.
-3. برای نام فایل، تابع، کلاس، دستور، متغیر از `inline code` استفاده کن — مثلاً `maxJsonLength` یا `ArrayList`.
-4. برای بلوک‌های کد از ``` استفاده کن.
-5. متن را به پاراگراف‌های کوتاه ۲-۳ جمله‌ای تقسیم کن.
-6. بین هر پاراگراف یک خط خالی بگذار.
-7. از bullet point (-) استفاده نکن — متن پیوسته تحلیلی بنویس.
-8. شماره‌گذاری نکن.
+1. از Markdown استاندارد استفاده کن — این Markdown در تلگرام به HTML تبدیل می‌شود و زیبا نمایش داده می‌شود.
+2. برای تأکید و لغات تخصصی از **bold** استفاده کن. مثلاً:
+   - **EDR Bypass** و **Zero-Day** و **Heap Overflow** و **Kernel Mode**
+3. برای نام فایل، تابع، کلاس، دستور، متغیر، مسیر فایل از `inline code` استفاده کن. مثلاً:
+   - `maxJsonLength` و `ArrayList` و `C:\\Windows\\System32` و `NtCreateFile`
+4. برای بلوک‌های کد طولانی از ``` استفاده کن.
+5. برای تأکید ملایم و اصطلاحات فرعی از *italic* استفاده کن. مثلاً:
+   - *به نظر می‌رسد* و *احتمالاً* و *مهاجم*
+6. متن را به پاراگراف‌های کوتاه ۲-۳ جمله‌ای تقسیم کن.
+7. بین هر پاراگراف یک خط خالی بگذار.
+8. از bullet point (-) و شماره‌گذاری استفاده نکن — متن پیوسته تحلیلی بنویس.
 9. از علامت‌های « » استفاده نکن — از " " استفاده کن.
 10. از — استفاده نکن — از - استفاده کن.
+11. لغات تخصصی انگلیسی را داخل **bold** بگذار تا متمایز شوند. مثلاً **Use-After-Free** و **Privilege Escalation**.
 
 TITLE:
 {title}
@@ -1065,7 +1120,7 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 def main() -> None:
     start = time.time()
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v3)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v4)")
     logger.info("=" * 70)
     logger.info("Filter models: %s", [m["model"] for m in FILTER_MODELS])
     logger.info("Analysis models: %s", [m["model"] for m in ANALYSIS_MODELS])
@@ -1138,7 +1193,6 @@ def main() -> None:
         if entry_id in current_ids:
             skipped_duplicate += 1
             continue
-
         link = entry.get("link", "")
         norm_link = normalize_url(link) if link else ""
         if norm_link:
@@ -1146,7 +1200,6 @@ def main() -> None:
                 skipped_duplicate += 1
                 continue
             current_urls.add(norm_link)
-
         title = clean_html(entry.get("title", ""))
         title_hash = hashlib.sha256(title.lower().strip().encode("utf-8")).hexdigest() if title else ""
         if title_hash:
@@ -1154,13 +1207,11 @@ def main() -> None:
                 skipped_duplicate += 1
                 continue
             current_titles.add(title_hash)
-
         if not is_recent(entry):
             skipped_old += 1
             seen_ids.add(entry_id)
             retry_counts.pop(entry_id, None)
             continue
-
         current_ids.add(entry_id)
         candidates.append((entry_id, entry))
 
