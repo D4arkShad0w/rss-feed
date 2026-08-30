@@ -1,11 +1,9 @@
 """
 RSS Security News Bot - Ultimate Edition
 ========================================
-- Uses OpenAI SDK for Groq to maximize connection stability in GitHub Actions.
-- Uses curl_cffi (Chrome Impersonation) as a fallback to aggressively bypass 403 WAFs.
-- Sequential AI cascade (Gemini -> Groq) with provider-level cooldowns.
-- Aborts safely if all models are rate-limited to protect article retry counts.
-- 5-second delay to strictly respect Gemini's free tier RPM limit.
+- Telegram reporting: Sends list of failed feeds directly to Telegram.
+- Groq first priority: Tries Groq first, falls back to Gemini.
+- Advanced fetch: Bypasses 403s (curl_cffi) and SSL errors (verify=False) automatically.
 """
 
 from __future__ import annotations
@@ -16,6 +14,7 @@ import json
 import os
 import re
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -28,6 +27,10 @@ import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# Suppress warnings for verify=False fallback
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+requests.packages.urllib3.disable_warnings()
 
 from google import genai
 from google.genai import types
@@ -77,7 +80,6 @@ FEED_TIMEOUT = 15
 ARTICLE_TIMEOUT = 20
 TELEGRAM_TIMEOUT = 10
 
-# 5 seconds delay keeps us safely under 15 RPM for Gemini free tier limit
 GEMINI_DELAY = 5.0
 MODEL_COOLDOWN_SECONDS = 1800
 TRANSIENT_COOLDOWN_SECONDS = 300
@@ -94,16 +96,15 @@ USER_AGENT = (
 # MODEL CONFIGURATION
 # ============================================================
 
-# Prioritizing Gemini first for filtering to avoid Groq timeouts.
+# Groq first, Gemini fallback
 FILTER_MODELS = [
-    {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
     {"provider": "groq", "model": "llama-3.1-8b-instant"},
-    {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
+    {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
     {"provider": "groq", "model": "openai/gpt-oss-20b"},
+    {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
     {"provider": "groq", "model": "llama-3.3-70b-versatile"},
 ]
 
-# For deep analysis, start with heavy Groq models, fallback to Gemini.
 ANALYSIS_MODELS = [
     {"provider": "groq", "model": "openai/gpt-oss-120b"},
     {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
@@ -153,7 +154,6 @@ def should_skip_model(model_key: str) -> bool:
 def mark_model_error(model_key: str, reason: str = "") -> None:
     cooldown = cooldown_for(reason)
     if cooldown == 0:
-        logger.warning("  [SKIP COOLDOWN] %s — %s", model_key, reason[:300])
         return
 
     model_error_state[model_key] = (time.time(), cooldown)
@@ -301,7 +301,7 @@ INTERESTS_PROMPT = build_interests_prompt()
 
 
 # ============================================================
-# HTTP SESSION & ROBUST GET
+# HTTP SESSION & ADVANCED FETCH
 # ============================================================
 
 def build_session() -> requests.Session:
@@ -343,22 +343,43 @@ def is_safe_url(url: Optional[str]) -> bool:
     except Exception:
         return False
 
-def robust_get(url: str, timeout: int) -> Optional[requests.Response]:
-    """Tries standard requests, falls back to Chrome impersonation via curl_cffi."""
+def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
+    """
+    Advanced Multi-Layer HTTP GET:
+    1. Standard requests with rich headers.
+    2. If 403/418/503, use curl_cffi Chrome impersonation (bypasses WAF).
+    3. If SSL Error, retry with verify=False.
+    """
+    method = "requests"
     try:
         response = HTTP.get(url, timeout=timeout, allow_redirects=True)
-        # If blocked by WAF, try to bypass
         if response.status_code in (403, 418, 503, 401):
-            raise requests.exceptions.RequestException("Blocked by WAF")
+            logger.info("  [HTTP] %d detected via %s, bypassing with Chrome impersonation for %s", response.status_code, method, url)
+            method = "curl_cffi"
+            response = cffi_requests.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True)
+        
+        if response.status_code != 200:
+            logger.warning("[FETCH FAILED] %s | HTTP %d | Method: %s", url, response.status_code, method)
+            return None
         return response
+        
     except Exception as e:
-        logger.info("  [HTTP] Standard GET failed (%s), trying Chrome impersonation...", str(e)[:100])
-        try:
-            cffi_resp = cffi_requests.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True)
-            logger.info("  [HTTP] curl_cffi impersonation returned %d", cffi_resp.status_code)
-            return cffi_resp
-        except Exception as e2:
-            logger.warning("  [HTTP] Fallback failed: %s", str(e2)[:200])
+        error_msg = str(e)
+        # Handle SSL Certificate Errors
+        if "SSL" in error_msg or "CERTIFICATE_VERIFY_FAILED" in error_msg:
+            logger.info("  [HTTP] SSL Error detected, retrying without verification for %s", url)
+            method = "requests_ssl_bypass"
+            try:
+                response = HTTP.get(url, timeout=timeout, allow_redirects=True, verify=False)
+                if response.status_code != 200:
+                    logger.warning("[FETCH FAILED] %s | HTTP %d | Method: %s", url, response.status_code, method)
+                    return None
+                return response
+            except Exception as e2:
+                logger.warning("[FETCH ERROR] %s | %s | Method: %s", url, str(e2)[:100], method)
+                return None
+        else:
+            logger.warning("[FETCH ERROR] %s | %s | Method: %s", url, error_msg[:100], method)
             return None
 
 
@@ -380,7 +401,6 @@ else:
 
 if GROQ_AVAILABLE and GROQ_API_KEY:
     try:
-        # Using OpenAI SDK pointed to Groq's endpoint for max stability
         groq_client = OpenAI(
             api_key=GROQ_API_KEY,
             base_url="https://api.groq.com/openai/v1",
@@ -469,6 +489,10 @@ def _post_telegram(payload: Dict[str, Any]) -> bool:
 
 
 def send_status_message(text: str) -> bool:
+    # Truncate if too long for Telegram
+    if len(text) > 4000:
+        text = text[:4000] + "\n... (Truncated)"
+        
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -530,21 +554,19 @@ def send_telegram(
 # FEED & ARTICLE FETCH
 # ============================================================
 
-def fetch_single_feed(feed: Any) -> List[Any]:
+def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
     feed_url = feed.get("url") if isinstance(feed, dict) else getattr(feed, "url", None)
     if not feed_url or not is_safe_url(feed_url):
-        return []
+        return [], False
     try:
-        response = robust_get(feed_url, FEED_TIMEOUT)
-        if not response or response.status_code != 200:
-            if response:
-                logger.info("Feed HTTP %s: %s", response.status_code, feed_url)
-            return []
+        response = fetch_url(feed_url, FEED_TIMEOUT)
+        if not response:
+            return [], False
         parsed = feedparser.parse(response.content)
-        return parsed.entries[:POSTS_PER_FEED]
+        return parsed.entries[:POSTS_PER_FEED], True
     except Exception as e:
         logger.warning("Feed error %s: %s", feed_url, e)
-        return []
+        return [], False
 
 ARTICLE_SELECTORS = [
     "article", "main", "[role='main']", ".article", ".article-content",
@@ -557,10 +579,8 @@ def fetch_raw_html(url: str) -> Optional[str]:
     if not url or not is_safe_url(url):
         return None
     try:
-        response = robust_get(url, ARTICLE_TIMEOUT)
-        if not response or response.status_code != 200:
-            if response:
-                logger.info("Article HTTP %s: %s", response.status_code, url)
+        response = fetch_url(url, ARTICLE_TIMEOUT)
+        if not response:
             return None
         return response.text
     except Exception as e:
@@ -1045,15 +1065,20 @@ def main() -> None:
 
     all_entries: List[Any] = []
     successful_feeds = 0
+    failed_urls: List[str] = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_single_feed, feed): feed for feed in feeds}
         for future in as_completed(futures):
             try:
-                entries = future.result()
-                if entries:
+                entries, success = future.result()
+                feed_url = futures[future].get("url") if isinstance(futures[future], dict) else getattr(futures[future], "url", None)
+                if success:
                     successful_feeds += 1
-                all_entries.extend(entries)
+                    all_entries.extend(entries)
+                else:
+                    if feed_url:
+                        failed_urls.append(feed_url)
             except Exception as e:
                 logger.error("Feed worker error: %s", e)
 
@@ -1090,13 +1115,17 @@ def main() -> None:
     logger.info("Candidates before cap: %d", len(candidates))
     logger.info("Seen: %d | Old: %d | Duplicates: %d", skipped_seen, skipped_old, skipped_duplicate)
 
-    send_status_message(
+    # Telegram Status: Feeds Fetch
+    failed_str = "\n".join(failed_urls) if failed_urls else "None"
+    status_msg = (
         f"📥 *RSS دریافت شد*\n\n"
         f"▫️ فیدهای موفق: {successful_feeds}/{len(feeds)}\n"
         f"▫️ مطالب جدید: {len(candidates)}\n"
         f"▫️ قدیمی: {skipped_old}\n"
-        f"▫️ تکراری: {skipped_seen + skipped_duplicate}"
+        f"▫️ تکراری: {skipped_seen + skipped_duplicate}\n\n"
+        f"❌ *فیدهای ناموفق:*\n{failed_str}"
     )
+    send_status_message(status_msg)
 
     candidates.sort(key=lambda pair: entry_sort_key(pair[1]), reverse=True)
     deferred = candidates[MAX_ENTRIES_PER_RUN:]
@@ -1158,7 +1187,8 @@ def main() -> None:
     logger.info("Cooldown models: %d", len(cooling))
     logger.info("=" * 70)
 
-    send_status_message(
+    # Telegram Status: Run Complete
+    finish_msg = (
         f"✅ *اجرای ربات تمام شد*\n\n"
         f"▫️ زمان: {elapsed} ثانیه\n"
         f"▫️ بررسی‌شده: {total}\n"
@@ -1167,6 +1197,7 @@ def main() -> None:
         f"▫️ ناموفق/برای retry: {failed}\n"
         f"▫️ مدل‌های cooldown: {len(cooling)}"
     )
+    send_status_message(finish_msg)
 
 
 # ============================================================
