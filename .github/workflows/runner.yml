@@ -3,7 +3,7 @@ name: RSS Aggregator Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 */4 * * *"    # ✅ هر ۴ ساعت (۶ بار در روز)
 
 concurrency:
   group: rss-aggregator-bot
@@ -36,6 +36,7 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MAX_ENTRIES_PER_RUN: "60"    # ✅ اضافه شد
         run: python script.py
 
       - name: Persist seen-ids state
