@@ -28,6 +28,12 @@ Changes vs. the previous version (see PR/diff for details):
   - HTTP calls go through a shared `requests.Session` with retry/backoff,
     and article URLs are checked to be http(s) before being fetched.
   - `print()` calls replaced with the `logging` module.
+  - Gemini 3.x thinking tokens are bounded via `thinking_config` and 
+    `max_output_tokens` is properly sized.
+  - Provider-level cooldown for connection errors so one dead socket 
+    doesn't kill four models.
+  - Aborts run instead of burning retry counts for every article when 
+    infrastructure is down.
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ from urllib.parse import urlparse
 import feedparser
 import listparser
 import requests
+import httpx
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -90,7 +97,8 @@ POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "50"))
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
 FUTURE_TOLERANCE = timedelta(hours=6)  # forgive minor feed clock-skew
 
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "40"))
 
 FEED_TIMEOUT = 15
 ARTICLE_TIMEOUT = 20
@@ -98,6 +106,7 @@ TELEGRAM_TIMEOUT = 10
 
 GEMINI_DELAY = 0.3
 MODEL_COOLDOWN_SECONDS = 1800
+TRANSIENT_COOLDOWN_SECONDS = 300
 
 TELEGRAM_MAX_LEN = 4096
 
@@ -139,55 +148,57 @@ ANALYSIS_MODELS = [
 # MODEL COOLDOWN
 # ============================================================
 
-# A connection-level failure (DNS/TLS/TCP blip) says nothing about whether
-# the model itself is usable, so it shouldn't cost the model a full 30
-# minutes — that's what silently killed an entire run when a single early
-# network hiccup put every model on cooldown before entry #2 even started.
-# Real API errors (bad model name, quota exhausted, auth failure, etc.)
-# still get the long cooldown since retrying those sooner is pointless.
-TRANSIENT_COOLDOWN_SECONDS = 180
-
-_TRANSIENT_MARKERS = (
-    "connection error",
-    "connection reset",
-    "connection aborted",
-    "timed out",
-    "timeout",
-    "temporarily unavailable",
-    "econnreset",
-    "server disconnected",
-    " 502 ",
-    " 503 ",
-    " 504 ",
-)
+class NoModelsAvailable(RuntimeError):
+    pass
 
 model_error_state: Dict[str, Tuple[float, int]] = {}
 
 
 def is_transient_error(reason: str) -> bool:
-    text = f" {reason.lower()} "
-    return any(marker in text for marker in _TRANSIENT_MARKERS)
+    reason_lower = reason.lower()
+    return (
+        "connection" in reason_lower or 
+        "429" in reason or 
+        "timeout" in reason_lower or 
+        "rate limit" in reason_lower
+    )
 
 
 def cooldown_for(reason: str) -> int:
-    return TRANSIENT_COOLDOWN_SECONDS if is_transient_error(reason) else MODEL_COOLDOWN_SECONDS
+    # Parse failures shouldn't put a model in cooldown
+    if "Invalid filter" in reason or "Empty analysis" in reason:
+        return 0
+    if is_transient_error(reason):
+        return TRANSIENT_COOLDOWN_SECONDS
+    return MODEL_COOLDOWN_SECONDS
 
 
 def should_skip_model(model_key: str) -> bool:
-    entry = model_error_state.get(model_key)
-    if entry is None:
-        return False
-    last_error, cooldown_seconds = entry
-    return (time.time() - last_error) < cooldown_seconds
+    provider = model_key.split("/", 1)[0]
+    for key in (model_key, f"__provider__/{provider}"):
+        entry = model_error_state.get(key)
+        if entry and (time.time() - entry[0]) < entry[1]:
+            return True
+    return False
 
 
 def mark_model_error(model_key: str, reason: str = "") -> None:
-    cooldown_seconds = cooldown_for(reason)
-    model_error_state[model_key] = (time.time(), cooldown_seconds)
+    cooldown = cooldown_for(reason)
+    if cooldown == 0:
+        logger.warning("  [SKIP COOLDOWN] %s — %s", model_key, reason[:300])
+        return
+
+    model_error_state[model_key] = (time.time(), cooldown)
+    
+    # Mark provider if it's a connection issue
+    if "connection" in reason.lower():
+        provider = model_key.split("/", 1)[0]
+        model_error_state[f"__provider__/{provider}"] = (time.time(), cooldown)
+
     logger.warning(
         "[COOLDOWN] %s for %d min%s",
         model_key,
-        max(1, cooldown_seconds // 60),
+        cooldown // 60,
         f" — {reason[:300]}" if reason else "",
     )
 
@@ -334,7 +345,7 @@ def build_session() -> requests.Session:
         connect=2,
         read=2,
         backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "POST"]),
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -374,8 +385,14 @@ else:
 
 if GROQ_AVAILABLE and GROQ_API_KEY:
     try:
-        groq_client = Groq(api_key=GROQ_API_KEY)
-        logger.info("Groq initialized.")
+        groq_client = Groq(
+            api_key=GROQ_API_KEY,
+            http_client=httpx.Client(
+                transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=2),
+                timeout=30.0,
+            ),
+        )
+        logger.info("Groq initialized (forced IPv4).")
     except Exception as e:
         logger.error("Groq init failed: %s", e)
 else:
@@ -656,7 +673,8 @@ def get_entry_id(entry: Any) -> Optional[str]:
 def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
-        return True
+        # If no date, don't blindly allow it (can let ancient undated items flood in)
+        return False
     try:
         date = datetime(*parsed[:6], tzinfo=timezone.utc)
         age = datetime.now(timezone.utc) - date
@@ -664,7 +682,12 @@ def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
         # instead of permanently blacklisting them on a bad timestamp.
         return -FUTURE_TOLERANCE <= age <= timedelta(days=max_age_days)
     except Exception:
-        return True
+        return False
+
+
+def entry_sort_key(entry: Any) -> datetime:
+    p = entry.get("published_parsed") or entry.get("updated_parsed")
+    return datetime(*p[:6], tzinfo=timezone.utc) if p else datetime.min.replace(tzinfo=timezone.utc)
 
 
 # ============================================================
@@ -674,6 +697,10 @@ def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
 def call_groq(model_name: str, prompt: str, max_tokens: int = 700) -> str:
     if not groq_client:
         raise RuntimeError("Groq client unavailable")
+
+    kwargs: Dict[str, Any] = {"max_completion_tokens": max(max_tokens, 512)}
+    if "gpt-oss" in model_name:
+        kwargs["reasoning_effort"] = "low"
 
     response = groq_client.chat.completions.create(
         model=model_name,
@@ -685,7 +712,7 @@ def call_groq(model_name: str, prompt: str, max_tokens: int = 700) -> str:
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
-        max_tokens=max_tokens,
+        **kwargs,
     )
 
     if not response or not response.choices:
@@ -702,18 +729,24 @@ def call_gemini(model_name: str, prompt: str, max_tokens: int = 700) -> str:
     if not gemini_client:
         raise RuntimeError("Gemini client unavailable")
 
+    kwargs: Dict[str, Any] = {"max_output_tokens": max(max_tokens, 512)}
+    if model_name.startswith("gemini-3"):
+        # Thinking tokens come out of max_output_tokens. Keep it minimal
+        # and leave temperature at the recommended default of 1.0.
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
+    else:
+        kwargs["temperature"] = 0.2
+
     response = gemini_client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2, max_output_tokens=max_tokens
-        ),
+        model=model_name, contents=prompt,
+        config=types.GenerateContentConfig(**kwargs),
     )
 
     text = getattr(response, "text", None)
     if not text:
-        raise RuntimeError("Empty Gemini response")
-
+        cand = (getattr(response, "candidates", None) or [None])[0]
+        reason = getattr(cand, "finish_reason", "UNKNOWN")
+        raise RuntimeError(f"Empty Gemini response (finish_reason={reason})")
     return text.strip()
 
 
@@ -723,34 +756,6 @@ def call_model(provider: str, model: str, prompt: str, max_tokens: int = 700) ->
     if provider == "gemini":
         return call_gemini(model, prompt, max_tokens)
     raise RuntimeError(f"Unknown provider: {provider}")
-
-
-def call_model_resilient(
-    provider: str,
-    model: str,
-    prompt: str,
-    max_tokens: int = 700,
-    retries: int = 1,
-    retry_delay: float = 3.0,
-) -> str:
-    """Like call_model, but gives a transient network blip one more chance
-    (with a real delay) before the caller has to fall back to the next
-    model and put this one on cooldown."""
-    last_exc: Optional[Exception] = None
-    for attempt in range(retries + 1):
-        try:
-            return call_model(provider, model, prompt, max_tokens)
-        except Exception as e:
-            last_exc = e
-            if attempt < retries and is_transient_error(str(e)):
-                logger.info(
-                    "  [RETRY] %s/%s transient error, retrying in %.1fs: %s",
-                    provider, model, retry_delay, str(e)[:150],
-                )
-                time.sleep(retry_delay)
-                continue
-            raise
-    raise last_exc  # pragma: no cover — loop always returns or raises above
 
 
 # ============================================================
@@ -821,6 +826,8 @@ def parse_filter_result(result: Optional[str]) -> Optional[bool]:
 
 def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
     prompt = build_filter_prompt(title, summary, source)
+    
+    attempted_any = False
 
     for item in FILTER_MODELS:
         provider, model = item["provider"], item["model"]
@@ -830,9 +837,11 @@ def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
             logger.info("  [FILTER] skip cooldown: %s", key)
             continue
 
+        attempted_any = True
+
         try:
             logger.info("  [FILTER] trying %s", key)
-            result = call_model_resilient(provider, model, prompt, max_tokens=50)
+            result = call_model(provider, model, prompt, max_tokens=50)
             decision = parse_filter_result(result)
 
             if decision is None:
@@ -849,8 +858,8 @@ def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
             continue
 
     logger.error("  [FILTER] All models failed.")
-    # If filtering itself fails, don't silently reject the article —
-    # signal "unknown" so the caller can retry it next run.
+    if not attempted_any:
+        raise NoModelsAvailable("No models available for filtering")
     return None
 
 
@@ -915,6 +924,8 @@ ARTICLE:
 
 def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optional[str]:
     prompt = build_analysis_prompt(title, article_text, link, source)
+    
+    attempted_any = False
 
     for item in ANALYSIS_MODELS:
         provider, model = item["provider"], item["model"]
@@ -924,9 +935,11 @@ def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optio
             logger.info("  [ANALYSIS] skip cooldown: %s", key)
             continue
 
+        attempted_any = True
+
         try:
             logger.info("  [ANALYSIS] trying %s", key)
-            result = call_model_resilient(provider, model, prompt, max_tokens=1200)
+            result = call_model(provider, model, prompt, max_tokens=1200)
             if not result:
                 raise RuntimeError("Empty analysis")
 
@@ -938,6 +951,8 @@ def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optio
             mark_model_error(key, str(e))
             continue
 
+    if not attempted_any:
+        raise NoModelsAvailable("No models available for deep analysis")
     return None
 
 
@@ -1054,6 +1069,8 @@ def main() -> None:
     logger.info("RSS SECURITY NEWS BOT")
     logger.info("=" * 70)
 
+    logger.info("Filter models: %s", [m["model"] for m in FILTER_MODELS])
+
     logger.info("BOT_TOKEN: %s", "OK" if BOT_TOKEN else "MISSING")
     logger.info("CHAT_ID: %s", "OK" if CHAT_ID else "MISSING")
     logger.info("GEMINI_API_KEY: %s", "OK" if GEMINI_API_KEY else "MISSING")
@@ -1134,7 +1151,7 @@ def main() -> None:
         current_ids.add(entry_id)
         candidates.append((entry_id, entry))
 
-    logger.info("Candidates: %d", len(candidates))
+    logger.info("Candidates before cap: %d", len(candidates))
     logger.info("Seen: %d | Old: %d | Duplicates: %d", skipped_seen, skipped_old, skipped_duplicate)
 
     send_status_message(
@@ -1144,6 +1161,11 @@ def main() -> None:
         f"▫️ قدیمی: {skipped_old}\n"
         f"▫️ تکراری: {skipped_seen + skipped_duplicate}"
     )
+
+    # Sort newest first, and defer the rest
+    candidates.sort(key=lambda pair: entry_sort_key(pair[1]), reverse=True)
+    deferred = candidates[MAX_ENTRIES_PER_RUN:]
+    candidates = candidates[:MAX_ENTRIES_PER_RUN]
 
     # --------------------------------------------------------
     # Process sequentially (AI calls stay sequential to avoid rate limits)
@@ -1176,9 +1198,20 @@ def main() -> None:
                 else:
                     retry_counts[entry_id] = count
 
+        except NoModelsAvailable:
+            logger.error("All providers unavailable — aborting run, state preserved.")
+            break
         except Exception as e:
             logger.error("[FATAL ENTRY ERROR] %s", e)
             failed += 1
+            # Don't count infrastructure exceptions against retries
+            successfully_processed.add(entry_id)
+            retry_counts.pop(entry_id, None)
+
+        # Save state every 10 items incrementally
+        if index % 10 == 0:
+            seen_ids.update(successfully_processed)
+            save_state(seen_ids, retry_counts)
 
         time.sleep(GEMINI_DELAY)
 
@@ -1194,6 +1227,7 @@ def main() -> None:
     logger.info("=" * 70)
     logger.info("Finished in %ss", elapsed)
     logger.info("Sent: %d | Rejected: %d | Failed/retry: %d", sent, rejected, failed)
+    logger.info("Deferred for next run: %d", len(deferred))
     logger.info("Cooldown models: %d", len(cooling))
     logger.info("=" * 70)
 
