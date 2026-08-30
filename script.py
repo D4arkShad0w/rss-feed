@@ -1,14 +1,17 @@
 """
-RSS Security News Bot - Final Edition
-======================================
+RSS Security News Bot - Final Edition v2
+==========================================
 - Groq SDK رسمی (بدون http_client سفارشی)
 - .strip() روی همه‌ی API Keys
 - 6-Layer fetch: requests → curl_cffi(×4) → verify=False
-- build_session با هدرهای ساده (مطابق تست موفق)
+- Thread-Local Session (thread-safe)
+- build_session با هدرهای ساده
 - Smart URL Variants + RSS Discovery + Site Scraping
 - Triple Dedup: entry_id + normalized URL + title hash
 - Title Translation: فارسی با حفظ لغات تخصصی
-- MAX_ENTRIES_PER_RUN = 60
+- Markdown → HTML conversion برای نمایش درست در تلگرام
+- MAX_ENTRIES_PER_RUN = 100
+- MAX_WORKERS = 5
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import html
 import json
 import os
 import re
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -63,7 +67,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OPML_FILE = "feeds.opml"
 STATE_FILE = "seen_ids.json"
 
-MAX_WORKERS = 20
+MAX_WORKERS = 5
 POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "50"))
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
 FUTURE_TOLERANCE = timedelta(hours=6)
@@ -180,10 +184,9 @@ def build_interests_prompt() -> str:
 INTERESTS_PROMPT = build_interests_prompt()
 
 # ============================================================
-# HTTP SESSION & 6-LAYER FETCH
+# HTTP SESSION (Thread-Local)
 # ============================================================
 
-# ✅ هدرهای ساده — مطابق تست موفق
 def build_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
@@ -201,7 +204,13 @@ def build_session() -> requests.Session:
     session.mount("https://", adapter)
     return session
 
-HTTP = build_session()
+# ✅ Thread-Local Session — هر thread یک session مستقل دارد
+_thread_local = threading.local()
+
+def get_http() -> requests.Session:
+    if not hasattr(_thread_local, 'http'):
+        _thread_local.http = build_session()
+    return _thread_local.http
 
 def is_safe_url(url: Optional[str]) -> bool:
     if not url:
@@ -231,12 +240,14 @@ def normalize_url(url: str) -> str:
     except Exception:
         return url
 
-# ✅ 6-Layer fetch — تست‌شده و تأییدشده
+# ✅ 6-Layer fetch — Thread-Safe
 def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
     """6-Layer: requests → curl_cffi(×4) → verify=False"""
+    http = get_http()
+
     # Layer 1: requests
     try:
-        response = HTTP.get(url, timeout=timeout, allow_redirects=True)
+        response = http.get(url, timeout=timeout, allow_redirects=True)
         if response.status_code == 200:
             return response
         if response.status_code not in (403, 418, 503, 401):
@@ -260,7 +271,7 @@ def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
 
     # Layer 6: verify=False
     try:
-        response = HTTP.get(url, timeout=timeout, allow_redirects=True, verify=False)
+        response = http.get(url, timeout=timeout, allow_redirects=True, verify=False)
         if response.status_code == 200:
             logger.info("  [HTTP] ✅ verify=False succeeded: %s", url)
             return response
@@ -326,7 +337,7 @@ def save_state(seen_ids: Set[str], retry_counts: Dict[str, int],
         logger.error("State save error: %s", e)
 
 # ============================================================
-# TEXT CLEANING
+# TEXT CLEANING + MARKDOWN → HTML
 # ============================================================
 
 def clean_html(text: Any) -> str:
@@ -345,6 +356,43 @@ def escape_html_text(text: Any) -> str:
         return ""
     return html.escape(str(text), quote=False)
 
+# ✅ Markdown → HTML برای تلگرام
+def markdown_to_html(text: str) -> str:
+    """Markdown را به HTML تلگرام تبدیل کن.
+    حتماً بعد از escape_html_text صدا زده شود.
+    """
+    if not text:
+        return ""
+    # Code blocks: ```lang\ntext``` → <pre>text</pre>
+    text = re.sub(r"```[\w]*\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
+    # Inline code: `text` → <code>text</code>
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    # Bold: **text** → <b>text</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # Bold: __text__ → <b>text</b>
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+    # Italic: *text* → <i>text</i> (بدون false positive برای *)
+    text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
+    # Headers: # text → <b>text</b>
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+    # Clean whitespace
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+# ✅ برای عنوان — Markdown را کامل حذف کن
+def strip_markdown(text: str) -> str:
+    """Markdown markers را کامل حذف کن — برای عنوان."""
+    if not text:
+        return ""
+    text = re.sub(r"```[\w]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    return text.strip()
+
 # ============================================================
 # TELEGRAM
 # ============================================================
@@ -354,7 +402,7 @@ def _post_telegram(payload: Dict[str, Any]) -> bool:
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        response = HTTP.post(url, json=payload, timeout=TELEGRAM_TIMEOUT)
+        response = get_http().post(url, json=payload, timeout=TELEGRAM_TIMEOUT)
         if response.ok:
             return True
         logger.error("Telegram error: %s %s", response.status_code, response.text[:500])
@@ -371,8 +419,15 @@ def send_status_message(text: str) -> bool:
 def send_telegram(title: str, analysis: str, link: str, category: str, source: str = "") -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         return False
-    title_e = escape_html_text(title)
-    analysis_e = escape_html_text(analysis)
+
+    # ✅ عنوان: Markdown حذف شود → escape HTML
+    title_clean = strip_markdown(title)
+    title_e = escape_html_text(title_clean)
+
+    # ✅ تحلیل: escape HTML → Markdown به HTML
+    analysis_escaped = escape_html_text(analysis)
+    analysis_html = markdown_to_html(analysis_escaped)
+
     category_e = escape_html_text(category)
     source_e = escape_html_text(source)
     if not is_safe_url(link):
@@ -383,10 +438,10 @@ def send_telegram(title: str, analysis: str, link: str, category: str, source: s
         source_line = f"🌐 <b>منبع:</b> {source_e}\n\n" if source_e else ""
         return (f"📌 <b>[{category_e}]</b>\n\n🔹 <b>{title_e}</b>\n\n{source_line}{analysis_text}\n\n🔗 <a href=\"{link_e}\">مطالعه مطلب اصلی</a>")
 
-    text = build(analysis_e)
+    text = build(analysis_html)
     if len(text) > TELEGRAM_MAX_LEN:
         overflow = len(text) - TELEGRAM_MAX_LEN + 20
-        trimmed = analysis_e[:max(0, len(analysis_e) - overflow)] + "…"
+        trimmed = analysis_html[:max(0, len(analysis_html) - overflow)] + "…"
         text = build(trimmed)
 
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
@@ -405,56 +460,45 @@ def generate_url_variants(url: str) -> List[str]:
     base = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path.rstrip("/")
 
-    # 1. Fix typos
     if "sympoium" in url:
         variants.append(url.replace("sympoium", "symposium"))
 
-    # 2. RSSHub alternatives
     if "rsshub.app" in url:
         for alt in ["rsshub.rssforever.com", "rss.shab.fun", "rsshub.feeded.xyz"]:
             variants.append(url.replace("rsshub.app", alt))
 
-    # 3. WordPress
     if "wordpress.com" in parsed.netloc or path.endswith(".php"):
         for p in ["?format=xml", "?feed=rss2", "?feed=atom"]:
             sep = "&" if "?" in url else "?"
             variants.append(url + (p.replace("?", sep) if sep == "&" else p))
 
-    # 4. Remove ?alt=rss
     if "alt=rss" in url:
         variants.append(url.replace("?alt=rss", "").replace("&alt=rss", "").rstrip("?"))
 
-    # 5. Add /feed/
     if not path.endswith("/feed") and not path.endswith(".xml"):
         variants.append(base + path + "/feed/")
         variants.append(base + path + "/rss/")
 
-    # 6. Common RSS paths
     if path in ["", "/", "/index.php", "/index.html", "/blog"]:
         for p in ["/feed", "/feed/", "/rss", "/rss.xml", "/atom.xml",
                   "/index.xml", "/feed.xml", "/?feed=rss2", "/blog/feed"]:
             variants.append(base + p)
 
-    # 7. http:// instead of https://
     if parsed.scheme == "https":
         variants.append(url.replace("https://", "http://", 1))
 
-    # 8. With/without www.
     if not parsed.netloc.startswith("www."):
         variants.append(url.replace(f"://{parsed.netloc}", f"://www.{parsed.netloc}", 1))
     if parsed.netloc.startswith("www."):
         variants.append(url.replace("://www.", "://", 1))
 
-    # 9. .xml variants
     if path.endswith(".xml"):
         variants.append(base + path[:-4])
         variants.append(base + path.replace(".xml", ".rss"))
 
-    # 10. /archive/feed/ patterns
     if "/archive/" in path:
         variants.append(base + "/feed/")
 
-    # Deduplicate
     seen = set()
     unique = []
     for v in variants:
@@ -582,25 +626,18 @@ ARTICLE_SELECTORS = [
 STRIP_TAGS = ["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]
 
 def try_fetch_feed_url(url: str) -> List[Any]:
-    """fetch → feedparser → RSS discovery → scraping"""
     response = fetch_url(url, FEED_TIMEOUT)
     if not response:
         return []
-
-    # ✅ همیشه feedparser را امتحان کن
     parsed = feedparser.parse(response.content)
     if parsed.entries:
         logger.info("  [FEED] ✅ feedparser: %d entries: %s", len(parsed.entries), url)
         return parsed.entries[:POSTS_PER_FEED]
-
-    # چک کن آیا XML است ولی entries ندارد
     content_preview = response.text[:500].strip()
     is_xml = any(tag in content_preview.lower() for tag in ["<?xml", "<rss", "<feed", "<channel", "<entry"])
     if is_xml:
         logger.warning("  [FEED] XML detected but 0 entries: %s", url)
         return []
-
-    # مرحله 2: RSS Discovery
     discovered = discover_rss_feeds(response.text, url)
     for rss_url in discovered:
         if normalize_url(rss_url) == normalize_url(url):
@@ -611,12 +648,9 @@ def try_fetch_feed_url(url: str) -> List[Any]:
             if rss_parsed.entries:
                 logger.info("  [DISCOVERY] ✅ Found RSS: %s (%d entries)", rss_url, len(rss_parsed.entries))
                 return rss_parsed.entries[:POSTS_PER_FEED]
-
-    # مرحله 3: Site Scraping
     scraped = scrape_site_articles(response.text, url)
     if scraped:
         return scraped[:POSTS_PER_FEED]
-
     return []
 
 def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
@@ -624,12 +658,9 @@ def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
     if not feed_url or not is_safe_url(feed_url):
         return [], False
     try:
-        # مرحله 1: URL اصلی
         entries = try_fetch_feed_url(feed_url)
         if entries:
             return entries, True
-
-        # مرحله 2: URL Variants
         variants = generate_url_variants(feed_url)
         if variants:
             logger.info("  [FEED] Original failed, trying %d variants for %s", len(variants), feed_url)
@@ -638,7 +669,6 @@ def fetch_single_feed(feed: Any) -> Tuple[List[Any], bool]:
             if entries:
                 logger.info("  [FEED] ✅ Variant succeeded: %s", variant_url)
                 return entries, True
-
         return [], False
     except Exception as e:
         logger.warning("Feed error %s: %s", feed_url, e)
@@ -902,9 +932,20 @@ TITLE_FA: [عنوان ترجمه‌شده به فارسی]
 2. اطلاعات عمومی خودت را به جای محتوای مقاله قرار نده.
 3. اگر متن ناقص است، صریحاً بگو.
 4. عنوان انگلیسی را دوباره کپی نکن — فقط نسخه‌ی ترجمه‌شده بده.
-5. از bulletهای خیلی کوتاه استفاده نکن؛ متن باید خوانا و تحلیلی باشد.
-6. خروجی فقط فارسی باشد (به جز لغات تخصصی انگلیسی).
-7. حدود ۱۰ تا ۱۵ خط بنویس.
+5. خروجی فقط فارسی باشد (به جز لغات تخصصی انگلیسی).
+6. حدود ۱۰ تا ۱۵ خط بنویس.
+
+قوانین قالب‌بندی (بسیار مهم):
+1. از Markdown استاندارد استفاده کن — این Markdown در تلگرام به HTML تبدیل می‌شود.
+2. برای تأکید و لغات تخصصی از **bold** استفاده کن — مثلاً **EDR Bypass** یا **Zero-Day**.
+3. برای نام فایل، تابع، کلاس، دستور، متغیر از `inline code` استفاده کن — مثلاً `maxJsonLength` یا `ArrayList`.
+4. برای بلوک‌های کد از ``` استفاده کن.
+5. متن را به پاراگراف‌های کوتاه ۲-۳ جمله‌ای تقسیم کن.
+6. بین هر پاراگراف یک خط خالی بگذار.
+7. از bullet point (-) استفاده نکن — متن پیوسته تحلیلی بنویس.
+8. شماره‌گذاری نکن.
+9. از علامت‌های « » استفاده نکن — از " " استفاده کن.
+10. از — استفاده نکن — از - استفاده کن.
 
 TITLE:
 {title}
@@ -920,7 +961,6 @@ ARTICLE:
 """
 
 def parse_analysis_response(response: str) -> Tuple[str, str]:
-    """استخراج عنوان ترجمه‌شده و تحلیل از پاسخ AI."""
     title_fa = ""
     analysis = response.strip()
 
@@ -939,7 +979,6 @@ def parse_analysis_response(response: str) -> Tuple[str, str]:
     return title_fa, analysis
 
 def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optional[Tuple[str, str]]:
-    """Returns (title_fa, analysis) or None."""
     prompt = build_analysis_prompt(title, article_text, link, source)
     attempted_any = False
     for item in ANALYSIS_MODELS:
@@ -1043,7 +1082,7 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 def main() -> None:
     start = time.time()
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v2)")
     logger.info("=" * 70)
     logger.info("Filter models: %s", [m["model"] for m in FILTER_MODELS])
     logger.info("Analysis models: %s", [m["model"] for m in ANALYSIS_MODELS])
@@ -1100,7 +1139,6 @@ def main() -> None:
     logger.info("Successful feeds: %d/%d", successful_feeds, len(feeds))
     logger.info("Downloaded entries: %d", len(all_entries))
 
-    # ✅ Triple Dedup
     candidates: List[Tuple[str, Any]] = []
     current_ids: Set[str] = set()
     current_urls: Set[str] = set()
