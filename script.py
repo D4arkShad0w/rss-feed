@@ -1,14 +1,16 @@
 """
-RSS Security News Bot - Final Edition v8
+RSS Security News Bot - Final Edition v9
 ==========================================
-۱. ETag + Thread-Local + 6-Layer fetch
-۲. Cleanup: فقط cap by size (50000) — بدون حذف by age
-۳. Markdown → HTML با پاک‌سازی ** اورفان
-۴. Auto-Delete پیام‌های وضعیت بعد از ۲ دقیقه
-۵. پیام "پایان" با sync_delete (اسکریپت صبر می‌کند تا پاک شود)
-۶. link_preview_options با prefer_large_media
-۷. Prompt: مطلقاً نام‌های خاص و لغات تخصصی ترجمه نشود
-۸. is_recent: بدون تاریخ → False (جلوگیری از تکرار)
+۱. is_recent: بدون تاریخ → True (پردازش می‌شوند)
+۲. MAX_UNDATED_ENTRIES_PER_FEED = 3 (برای RSS عادی)
+۳. MAX_UNDATED_ENTRIES_HTML_FEED = 1 (برای HTML feeds مثل Digital Whisper)
+۴. تشخیص HTML vs XML → محدود کردن هوشمند undated entries
+۵. ETag + Thread-Local + 6-Layer fetch
+۶. Cleanup: فقط cap by size (50000)
+۷. Markdown → HTML با پاک‌سازی ** اورفان
+۸. Auto-Delete پیام‌های وضعیت (sync_delete برای پایان)
+۹. link_preview_options با prefer_large_media
+۱۰. Prompt: مطلقاً نام‌های خاص ترجمه نشود
 """
 
 from __future__ import annotations
@@ -67,7 +69,8 @@ STATE_FILE = "seen_ids.json"
 
 MAX_WORKERS = 8
 POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "100"))
-MAX_UNDATED_ENTRIES_PER_FEED = 3
+MAX_UNDATED_ENTRIES_PER_FEED = 3     # ✅ برای RSS عادی
+MAX_UNDATED_ENTRIES_HTML_FEED = 1    # ✅ برای HTML feeds (Digital Whisper)
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
 FUTURE_TOLERANCE = timedelta(hours=6)
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
@@ -638,7 +641,7 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
     return entries[:POSTS_PER_FEED]
 
 # ============================================================
-# FEED FETCH
+# FEED FETCH — با تشخیص HTML + محدود کردن هوشمند
 # ============================================================
 
 ARTICLE_SELECTORS = [
@@ -647,7 +650,8 @@ ARTICLE_SELECTORS = [
 ]
 STRIP_TAGS = ["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]
 
-def filter_entries_by_date(entries: List[Any]) -> List[Any]:
+# ✅ filter_entries_by_date با پارامتر max_undated
+def filter_entries_by_date(entries: List[Any], max_undated: int = MAX_UNDATED_ENTRIES_PER_FEED) -> List[Any]:
     dated = []
     undated = []
     for e in entries:
@@ -655,8 +659,9 @@ def filter_entries_by_date(entries: List[Any]) -> List[Any]:
             dated.append(e)
         else:
             undated.append(e)
-    if len(undated) > MAX_UNDATED_ENTRIES_PER_FEED:
-        undated = undated[:MAX_UNDATED_ENTRIES_PER_FEED]
+    if len(undated) > max_undated:
+        logger.info("  [FEED] Limiting %d undated → %d", len(undated), max_undated)
+        undated = undated[:max_undated]
     return dated + undated
 
 def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
@@ -664,34 +669,51 @@ def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
     hostname = parsed.netloc.split(":")[0]
     if not check_dns(hostname):
         return [], False
+
     etag_data = etags.get(url, {})
     extra_headers = {}
     if etag_data.get("etag"):
         extra_headers["If-None-Match"] = etag_data["etag"]
     if etag_data.get("last_modified"):
         extra_headers["If-Modified-Since"] = etag_data["last_modified"]
+
     response = fetch_url(url, FEED_TIMEOUT,
                         extra_headers=extra_headers if extra_headers else None,
                         allow_304=True)
+
     if not response:
         return [], False
+
     if response.status_code == 304:
         logger.info("  [FEED] 304 Not Modified: %s", url)
         if url in etags:
             etags[url]["last_fetch"] = time.time()
         return [], False
+
     if response.status_code == 200:
         new_etag = response.headers.get("ETag")
         new_lm = response.headers.get("Last-Modified")
         etags[url] = {"etag": new_etag, "last_modified": new_lm, "last_fetch": time.time()}
+
+    # ✅ تشخیص HTML vs XML
+    ct = response.headers.get("content-type", "").lower()
+    is_html = "text/html" in ct or "application/xhtml" in ct
+
     parsed_feed = feedparser.parse(response.content)
     if parsed_feed.entries:
-        logger.info("  [FEED] ✅ feedparser: %d entries: %s", len(parsed_feed.entries), url)
-        return parsed_feed.entries[:POSTS_PER_FEED], True
+        # ✅ برای HTML feeds → max_undated = 1 (Digital Whisper fix)
+        # برای XML/RSS feeds → max_undated = 3
+        max_undated = MAX_UNDATED_ENTRIES_HTML_FEED if is_html else MAX_UNDATED_ENTRIES_PER_FEED
+        entries = filter_entries_by_date(parsed_feed.entries[:POSTS_PER_FEED], max_undated)
+        logger.info("  [FEED] ✅ feedparser: %d entries (%s): %s",
+                    len(entries), "HTML" if is_html else "XML", url)
+        return entries, True
+
     content_preview = response.text[:500].strip()
     is_xml = any(tag in content_preview.lower() for tag in ["<?xml", "<rss", "<feed", "<channel", "<entry"])
     if is_xml:
         return [], False
+
     discovered = discover_rss_feeds(response.text, url)
     for rss_url in discovered:
         if normalize_url(rss_url) == normalize_url(url):
@@ -701,10 +723,17 @@ def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
             rss_parsed = feedparser.parse(rss_response.content)
             if rss_parsed.entries:
                 logger.info("  [DISCOVERY] ✅ Found RSS: %s", rss_url)
-                return rss_parsed.entries[:POSTS_PER_FEED], True
+                entries = filter_entries_by_date(rss_parsed.entries[:POSTS_PER_FEED],
+                                                 MAX_UNDATED_ENTRIES_PER_FEED)
+                return entries, True
+
     scraped = scrape_site_articles(response.text, url)
     if scraped:
-        return scraped[:POSTS_PER_FEED], True
+        # ✅ scraped articles همیشه بدون تاریخ → max_undated = 1
+        entries = filter_entries_by_date(scraped[:POSTS_PER_FEED],
+                                         MAX_UNDATED_ENTRIES_HTML_FEED)
+        return entries, True
+
     return [], False
 
 def fetch_single_feed(feed: Any, etags: Dict) -> Tuple[List[Any], bool]:
@@ -715,7 +744,6 @@ def fetch_single_feed(feed: Any, etags: Dict) -> Tuple[List[Any], bool]:
         for attempt in range(2):
             entries, changed = try_fetch_feed_url(feed_url, etags)
             if entries:
-                entries = filter_entries_by_date(entries)
                 return entries[:POSTS_PER_FEED], True
             if attempt == 0 and not changed:
                 return [], True
@@ -726,7 +754,6 @@ def fetch_single_feed(feed: Any, etags: Dict) -> Tuple[List[Any], bool]:
         for variant_url in variants:
             entries, _ = try_fetch_feed_url(variant_url, etags)
             if entries:
-                entries = filter_entries_by_date(entries)
                 logger.info("  [FEED] ✅ Variant: %s", variant_url)
                 return entries[:POSTS_PER_FEED], True
         return [], False
@@ -814,14 +841,15 @@ def get_entry_id(entry: Any) -> Optional[str]:
 def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
-        # ✅ بدون تاریخ → False (قدیمی فرض کن → تکرار نمی‌شود)
-        return False
+        # ✅ بدون تاریخ → True (پردازش می‌شود)
+        # ایمنی: MAX_UNDATED (1-3 per feed) + seen dict (50000 = ~10 روز)
+        return True
     try:
         date = datetime(*parsed[:6], tzinfo=timezone.utc)
         age = datetime.now(timezone.utc) - date
         return -FUTURE_TOLERANCE <= age <= timedelta(days=max_age_days)
     except Exception:
-        return False
+        return True
 
 def entry_sort_key(entry: Any) -> datetime:
     p = entry.get("published_parsed") or entry.get("updated_parsed")
@@ -1175,7 +1203,7 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 def main() -> None:
     start = time.time()
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v8)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v9)")
     logger.info("=" * 70)
     logger.info("BOT_TOKEN: %s", "OK" if BOT_TOKEN else "MISSING")
     logger.info("GROQ_API_KEY: %s", "OK" if GROQ_API_KEY else "MISSING")
@@ -1365,7 +1393,6 @@ def main() -> None:
         f"▫️ ناموفق: {failed}\n"
         f"▫️ State: {len(seen)} IDs | {len(etags)} etags"
     )
-    # ✅ sync_delete=True — اسکریپت صبر می‌کند تا پیام پاک شود
     send_status_message(finish_msg, sync_delete=True)
 
 # ============================================================
