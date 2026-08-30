@@ -119,9 +119,9 @@ FILTER_MODELS = [
     {"provider": "groq", "model": "openai/gpt-oss-20b"},
     {"provider": "groq", "model": "llama-3.3-70b-versatile"},
     {"provider": "groq", "model": "openai/gpt-oss-120b"},
-    {"provider": "gemini", "model": "gemini-2.5-flash-lite"},
-    {"provider": "gemini", "model": "gemini-2.5-flash"},
-    {"provider": "gemini", "model": "gemini-2.5-pro"},
+    {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
+    {"provider": "gemini", "model": "gemini-3.7-flash"},
+    {"provider": "gemini", "model": "gemini-3.1-pro-preview"},
 ]
 
 # 8B is intentionally NOT used here; deep analysis starts from GPT-OSS 20B.
@@ -129,9 +129,9 @@ ANALYSIS_MODELS = [
     {"provider": "groq", "model": "openai/gpt-oss-20b"},
     {"provider": "groq", "model": "llama-3.3-70b-versatile"},
     {"provider": "groq", "model": "openai/gpt-oss-120b"},
-    {"provider": "gemini", "model": "gemini-2.5-flash-lite"},
-    {"provider": "gemini", "model": "gemini-2.5-flash"},
-    {"provider": "gemini", "model": "gemini-2.5-pro"},
+    {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
+    {"provider": "gemini", "model": "gemini-3.7-flash"},
+    {"provider": "gemini", "model": "gemini-3.1-pro-preview"},
 ]
 
 
@@ -139,22 +139,55 @@ ANALYSIS_MODELS = [
 # MODEL COOLDOWN
 # ============================================================
 
-model_error_times: Dict[str, float] = {}
+# A connection-level failure (DNS/TLS/TCP blip) says nothing about whether
+# the model itself is usable, so it shouldn't cost the model a full 30
+# minutes — that's what silently killed an entire run when a single early
+# network hiccup put every model on cooldown before entry #2 even started.
+# Real API errors (bad model name, quota exhausted, auth failure, etc.)
+# still get the long cooldown since retrying those sooner is pointless.
+TRANSIENT_COOLDOWN_SECONDS = 180
+
+_TRANSIENT_MARKERS = (
+    "connection error",
+    "connection reset",
+    "connection aborted",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "econnreset",
+    "server disconnected",
+    " 502 ",
+    " 503 ",
+    " 504 ",
+)
+
+model_error_state: Dict[str, Tuple[float, int]] = {}
+
+
+def is_transient_error(reason: str) -> bool:
+    text = f" {reason.lower()} "
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def cooldown_for(reason: str) -> int:
+    return TRANSIENT_COOLDOWN_SECONDS if is_transient_error(reason) else MODEL_COOLDOWN_SECONDS
 
 
 def should_skip_model(model_key: str) -> bool:
-    last_error = model_error_times.get(model_key)
-    if last_error is None:
+    entry = model_error_state.get(model_key)
+    if entry is None:
         return False
-    return (time.time() - last_error) < MODEL_COOLDOWN_SECONDS
+    last_error, cooldown_seconds = entry
+    return (time.time() - last_error) < cooldown_seconds
 
 
 def mark_model_error(model_key: str, reason: str = "") -> None:
-    model_error_times[model_key] = time.time()
+    cooldown_seconds = cooldown_for(reason)
+    model_error_state[model_key] = (time.time(), cooldown_seconds)
     logger.warning(
         "[COOLDOWN] %s for %d min%s",
         model_key,
-        MODEL_COOLDOWN_SECONDS // 60,
+        max(1, cooldown_seconds // 60),
         f" — {reason[:300]}" if reason else "",
     )
 
@@ -692,6 +725,34 @@ def call_model(provider: str, model: str, prompt: str, max_tokens: int = 700) ->
     raise RuntimeError(f"Unknown provider: {provider}")
 
 
+def call_model_resilient(
+    provider: str,
+    model: str,
+    prompt: str,
+    max_tokens: int = 700,
+    retries: int = 1,
+    retry_delay: float = 3.0,
+) -> str:
+    """Like call_model, but gives a transient network blip one more chance
+    (with a real delay) before the caller has to fall back to the next
+    model and put this one on cooldown."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return call_model(provider, model, prompt, max_tokens)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries and is_transient_error(str(e)):
+                logger.info(
+                    "  [RETRY] %s/%s transient error, retrying in %.1fs: %s",
+                    provider, model, retry_delay, str(e)[:150],
+                )
+                time.sleep(retry_delay)
+                continue
+            raise
+    raise last_exc  # pragma: no cover — loop always returns or raises above
+
+
 # ============================================================
 # FILTER PROMPT / PARSER
 # ============================================================
@@ -771,7 +832,7 @@ def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
 
         try:
             logger.info("  [FILTER] trying %s", key)
-            result = call_model(provider, model, prompt, max_tokens=50)
+            result = call_model_resilient(provider, model, prompt, max_tokens=50)
             decision = parse_filter_result(result)
 
             if decision is None:
@@ -865,7 +926,7 @@ def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optio
 
         try:
             logger.info("  [ANALYSIS] trying %s", key)
-            result = call_model(provider, model, prompt, max_tokens=1200)
+            result = call_model_resilient(provider, model, prompt, max_tokens=1200)
             if not result:
                 raise RuntimeError("Empty analysis")
 
@@ -1127,7 +1188,7 @@ def main() -> None:
     seen_ids.update(successfully_processed)
     save_state(seen_ids, retry_counts)
 
-    cooling = [key for key in model_error_times if should_skip_model(key)]
+    cooling = [key for key in model_error_state if should_skip_model(key)]
     elapsed = round(time.time() - start, 1)
 
     logger.info("=" * 70)
