@@ -4,8 +4,8 @@ RSS Security News Bot - Final Edition
 - Groq SDK رسمی (بدون http_client سفارشی)
 - .strip() روی همه‌ی API Keys
 - 6-Layer fetch: requests → curl_cffi(×4) → verify=False
-- Smart URL Variants: fix typos, RSSHub alternatives, WordPress
-- RSS Discovery + Site Scraping
+- build_session با هدرهای ساده (مطابق تست موفق)
+- Smart URL Variants + RSS Discovery + Site Scraping
 - Triple Dedup: entry_id + normalized URL + title hash
 - Title Translation: فارسی با حفظ لغات تخصصی
 - MAX_ENTRIES_PER_RUN = 60
@@ -183,17 +183,19 @@ INTERESTS_PROMPT = build_interests_prompt()
 # HTTP SESSION & 6-LAYER FETCH
 # ============================================================
 
+# ✅ هدرهای ساده — مطابق تست موفق
 def build_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     })
-    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504], allowed_methods=frozenset(["GET", "POST"]))
+    retry = Retry(
+        total=2, connect=2, read=2, backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -570,7 +572,7 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
     return entries[:POSTS_PER_FEED]
 
 # ============================================================
-# FEED FETCH — الگوریتم نهایی
+# FEED FETCH
 # ============================================================
 
 ARTICLE_SELECTORS = [
@@ -787,7 +789,7 @@ def call_model(provider: str, model: str, prompt: str, max_tokens: int = 700) ->
     raise RuntimeError(f"Unknown provider: {provider}")
 
 # ============================================================
-# FILTER & ANALYSIS LOGIC (با Title Translation)
+# FILTER & ANALYSIS LOGIC
 # ============================================================
 
 def build_filter_prompt(title: str, summary: str, source: str = "") -> str:
