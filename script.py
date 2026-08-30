@@ -4,6 +4,7 @@ RSS Security News Bot - Ultimate Edition (Groq SDK)
 - Telegram reporting: Sends list of failed feeds directly to Telegram.
 - Groq first priority: Uses official Groq SDK, falls back to Gemini.
 - Advanced fetch: Bypasses 403s (curl_cffi) and SSL errors (verify=False) automatically.
+- Environment-aware HTTP client (GitHub Actions compatible).
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ requests.packages.urllib3.disable_warnings()
 from google import genai
 from google.genai import types
 
-# ✅ Groq SDK رسمی به‌جای OpenAI SDK
+# ✅ Groq SDK رسمی
 try:
     from groq import Groq
     GROQ_AVAILABLE = True
@@ -131,9 +132,9 @@ model_error_state: Dict[str, Tuple[float, int]] = {}
 def is_transient_error(reason: str) -> bool:
     reason_lower = reason.lower()
     return (
-        "connection" in reason_lower or 
-        "429" in reason or 
-        "timeout" in reason_lower or 
+        "connection" in reason_lower or
+        "429" in reason or
+        "timeout" in reason_lower or
         "rate limit" in reason_lower
     )
 
@@ -161,7 +162,7 @@ def mark_model_error(model_key: str, reason: str = "") -> None:
         return
 
     model_error_state[model_key] = (time.time(), cooldown)
-    
+
     if "connection" in reason.lower():
         provider = model_key.split("/", 1)[0]
         model_error_state[f"__provider__/{provider}"] = (time.time(), cooldown)
@@ -361,12 +362,12 @@ def fetch_url(url: str, timeout: int) -> Optional[requests.Response]:
             logger.info("  [HTTP] %d detected via %s, bypassing with Chrome impersonation for %s", response.status_code, method, url)
             method = "curl_cffi"
             response = cffi_requests.get(url, impersonate="chrome", timeout=timeout, allow_redirects=True)
-        
+
         if response.status_code != 200:
             logger.warning("[FETCH FAILED] %s | HTTP %d | Method: %s", url, response.status_code, method)
             return None
         return response
-        
+
     except Exception as e:
         error_msg = str(e)
         # Handle SSL Certificate Errors
@@ -403,17 +404,35 @@ if GEMINI_API_KEY:
 else:
     logger.warning("GEMINI_API_KEY missing.")
 
-# ✅ استفاده رسمی از Groq SDK
+# ✅ Groq SDK رسمی + Environment-Aware HTTP Client
 if GROQ_AVAILABLE and GROQ_API_KEY:
     try:
-        groq_client = Groq(
-            api_key=GROQ_API_KEY,
-            http_client=httpx.Client(
-                transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=2),
-                timeout=30.0,
-            ),
+        # تشخیص محیط: GitHub Actions نیازی به force IPv4 ندارد
+        is_github_actions = (
+            os.getenv("GITHUB_ACTIONS") == "true"
+            or os.getenv("CI") == "true"
         )
-        logger.info("Groq initialized via official Groq SDK (forced IPv4).")
+
+        if is_github_actions:
+            # GitHub Actions: بدون local_address (سبب Connection Error می‌شود)
+            groq_client = Groq(
+                api_key=GROQ_API_KEY,
+                http_client=httpx.Client(
+                    transport=httpx.HTTPTransport(retries=2),
+                    timeout=30.0,
+                ),
+            )
+            logger.info("Groq initialized via official Groq SDK (GitHub Actions mode).")
+        else:
+            # محیط محلی/Colab: force IPv4 برای دور زدن مشکلات IPv6
+            groq_client = Groq(
+                api_key=GROQ_API_KEY,
+                http_client=httpx.Client(
+                    transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=2),
+                    timeout=30.0,
+                ),
+            )
+            logger.info("Groq initialized via official Groq SDK (Local mode — forced IPv4).")
     except Exception as e:
         logger.error("Groq init failed: %s", e)
         groq_client = None
@@ -497,7 +516,7 @@ def send_status_message(text: str) -> bool:
     # Truncate if too long for Telegram
     if len(text) > 4000:
         text = text[:4000] + "\n... (Truncated)"
-        
+
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -700,7 +719,7 @@ def call_groq(model_name: str, prompt: str, max_tokens: int = 700) -> str:
     if not groq_client:
         raise RuntimeError("Groq client unavailable")
 
-    # ✅ Groq SDK از max_tokens استفاده می‌کند (نه max_completion_tokens)
+    # ✅ Groq SDK از max_tokens استفاده می‌کند
     kwargs: Dict[str, Any] = {"max_tokens": max(max_tokens, 512)}
 
     # فقط مدل‌های gpt-oss از reasoning_effort پشتیبانی می‌کنند
