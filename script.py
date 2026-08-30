@@ -17,127 +17,108 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 OPML_FILE = "feeds.opml"
 STATE_FILE = "seen_ids.json"
 
-# --- تنظیمات عملکردی برای ۱۰۰ خبر در هر ۵ ساعت ---
-MAX_WORKERS = 30       # تعداد فیدهایی که همزمان دانلود می‌شوند
-POSTS_PER_FEED = 50    # حداکثر پست‌های دریافتی از هر فید
-MAX_AGE_DAYS = 7       # فقط پست‌های ۷ روز اخیر پردازش می‌شوند (جلوگیری از پردازش تاریخچه)
-TIMEOUT = 10           # Timeout برای درخواست‌های شبکه
-GEMINI_DELAY = 0.3     # تأخیر بین درخواست‌های Gemini برای جلوگیری از Rate Limit
+MAX_WORKERS = 30
+POSTS_PER_FEED = 50
+MAX_AGE_DAYS = 7
+TIMEOUT = 10
+GEMINI_DELAY = 0.3
 
-# --- لیست کامل علاقه‌مندی‌ها به صورت دسته‌بندی‌شده ---
 INTEREST_CATEGORIES = {
-    "LOW-LEVEL SECURITY & VULNERABILITY RESEARCH": [
-        "Vulnerability Research با ارزش فنی بالا", "Exploit Development", "0-day و 1-dayهای مهم با تحلیل فنی",
-        "Exploit Chain و Exploit Chaining", "تحقیقات جدید در Memory Corruption", "Use-After-Free", "Heap Exploitation",
-        "Kernel Exploitation", "Privilege Escalation با تحلیل فنی", "Sandbox Escape", "Security Boundary Bypass",
-        "Mitigation Bypass", "Control-Flow Integrity Bypass", "Code Integrity Bypass", "PatchGuard Bypass",
-        "Windows Defender / EDR Bypass", "تحقیقات جدید در Windows Security Architecture",
-        "CVE فقط در صورت وجود exploit واقعی، PoC مهم، تحلیل فنی عمیق، exploit chain، یا اثرگذاری گسترده"
+    "LOW-LEVEL SECURITY": [
+        "Exploit Development", "Memory Corruption", "Use-After-Free", "Heap Exploitation",
+        "Kernel Exploitation", "Privilege Escalation", "Sandbox Escape", "Mitigation Bypass",
+        "PatchGuard Bypass", "Windows Defender / EDR Bypass", "0-day/1-day با تحلیل فنی"
     ],
-    "WINDOWS INTERNALS & KERNEL": [
-        "Windows Internals", "Windows Kernel", "Windows Kernel Security", "Windows Security Architecture",
-        "Windows Kernel Exploitation", "Windows Driver Security", "Windows Driver Vulnerabilities",
-        "Windows Code Integrity", "Driver Signature Enforcement", "Kernel Protection", "PatchGuard",
-        "Protected Process / PPL", "Secure Kernel", "VBS و Virtualization-Based Security", "Credential Guard",
-        "Windows Authentication Internals", "Windows Object Manager", "Windows Process / Thread Internals",
-        "Windows Memory Manager", "Windows I/O Internals", "Windows ETW و امنیت ETW", "Windows Security Mitigations"
+    "WINDOWS INTERNALS": [
+        "Windows Internals", "Windows Kernel Security", "Driver Security", "Code Integrity",
+        "PatchGuard", "PPL", "VBS", "Credential Guard", "ETW Security", "Security Mitigations"
     ],
-    "EDR / ENDPOINT / DETECTION": [
-        "EDR Architecture", "EDR Internals", "EDR Evasion", "EDR Bypass Techniques", "Endpoint Security Architecture",
-        "Detection Engineering با نوآوری فنی", "Detection Bypass", "Telemetry Evasion", "ETW Bypass", "AMSI Bypass",
-        "Security Product Internals", "تحقیقات فنی درباره EDRهای مطرح", "مقایسه فنی قابلیت‌های EDR", "روش‌های جدید تشخیص رفتار مخرب"
+    "EDR / ENDPOINT": [
+        "EDR Evasion", "EDR Bypass", "Detection Engineering", "Telemetry Evasion",
+        "AMSI Bypass", "Security Product Internals"
     ],
-    "REVERSE ENGINEERING & BINARY SECURITY": [
-        "Reverse Engineering", "Advanced Reverse Engineering", "Binary Analysis", "Binary Security",
-        "Static Analysis", "Dynamic Analysis", "Binary Instrumentation", "Software Internals",
-        "Malware Reverse Engineering", "Reverse Engineering Techniques", "تحقیقات جدید در Binary Analysis", "تحلیل فنی بدافزارها با تکنیک‌های جدید"
+    "REVERSE ENGINEERING": [
+        "Reverse Engineering", "Binary Analysis", "Malware Reverse Engineering",
+        "Static/Dynamic Analysis", "Binary Instrumentation"
     ],
-    "FUZZING & AUTOMATED VULNERABILITY DISCOVERY": [
-        "Fuzzing", "Advanced Fuzzing Techniques", "Kernel Fuzzing", "Coverage-Guided Fuzzing",
-        "Structure-Aware Fuzzing", "Grammar-Based Fuzzing", "Hybrid Fuzzing", "Fuzzing برای کشف vulnerability",
-        "Automated Vulnerability Discovery", "تحقیقات جدید در Fuzzing", "روش‌های جدید crash triage و root-cause analysis"
+    "FUZZING": [
+        "Fuzzing", "Kernel Fuzzing", "Coverage-Guided Fuzzing", "Hybrid Fuzzing",
+        "Automated Vulnerability Discovery"
     ],
-    "ROOTKIT / BOOTKIT / FIRMWARE": [
-        "Rootkit", "Kernel Rootkit", "Bootkit", "UEFI Security", "BIOS Security", "Firmware Security",
-        "Firmware Reverse Engineering", "Firmware Vulnerability Research", "UEFI Vulnerability Research",
-        "Secure Boot", "Boot Chain Security", "Platform Security", "Hardware Root of Trust",
-        "تحقیقات امنیتی در سطح firmware و boot chain"
+    "ROOTKIT / FIRMWARE": [
+        "Rootkit", "Bootkit", "UEFI Security", "Firmware Security", "Secure Boot",
+        "Hardware Root of Trust"
     ],
-    "MALWARE & ADVANCED ATTACK TECHNIQUES": [
-        "Advanced Malware Analysis", "Malware Internals", "Malware Techniques با نوآوری فنی",
-        "Advanced Persistence Techniques", "Stealth Techniques", "Defense Evasion", "Privilege Escalation Techniques",
-        "Initial Access Techniques با نوآوری", "Post-Exploitation Techniques با نوآوری", "Living-off-the-Land Techniques",
-        "تحقیقات جدید درباره تکنیک‌های پیچیده مهاجمان"
+    "MALWARE / ATTACK TECHNIQUES": [
+        "Advanced Malware Analysis", "Malware Techniques", "Persistence Techniques",
+        "Defense Evasion", "Living-off-the-Land"
     ],
-    "OPERATING SYSTEMS & LOW-LEVEL COMPUTER SCIENCE": [
-        "Operating Systems Internals", "Low-Level Systems", "Systems Programming", "Computer Architecture",
-        "CPU Architecture", "Memory Architecture", "Virtual Memory", "Processes and Threads", "Kernel Design",
-        "Compiler Internals", "Programming Language Internals", "Runtime Internals", "Linkers و Loaders",
-        "ELF Internals", "PE Internals", "Dynamic Linking", "Binary Formats", "Operating System Security Architecture"
+    "OS / LOW-LEVEL CS": [
+        "Operating Systems Internals", "Computer Architecture", "Compiler Internals",
+        "ELF/PE Internals", "Kernel Design"
     ],
-    "NETWORKING / PROTOCOL SECURITY": [
-        "Network Protocol Internals", "Protocol Security", "Network Security Research", "Protocol Vulnerability Research",
-        "Network Exploitation با نوآوری", "DNS Security Research", "SMB Security", "Windows Network Protocols",
-        "Authentication Protocol Security", "تحقیقات جدید در امنیت پروتکل‌ها"
+    "NETWORK / PROTOCOL SECURITY": [
+        "Protocol Security", "Network Exploitation", "DNS Security", "SMB Security",
+        "Authentication Protocol Security"
     ],
-    "ADVANCED COMPUTER SCIENCE": [
-        "تحقیقات جدید و غیرمعمول Computer Science", "Computer Science Research با کاربرد عملی",
-        "تحقیقات جدید در Systems", "تحقیقات جدید در Operating Systems", "تحقیقات جدید در Programming Languages",
-        "تحقیقات جدید در Computer Architecture", "تحقیقات جدید در Compilers", "ایده‌های غیرمتعارف و جالب در Computer Science",
-        "تکنیک‌های جدید و خلاقانه در سیستم‌های کامپیوتری"
+    "ADVANCED CS": [
+        "Computer Science Research", "Systems Research", "Programming Languages",
+        "Computer Architecture", "Unusual CS Projects"
     ],
-    "SECURITY RESEARCH / CONFERENCES": [
-        "تحقیقات منتشرشده در کنفرانس‌های امنیتی معتبر", "Black Hat", "DEF CON", "USENIX Security", "NDSS",
-        "ACM CCS", "IEEE Symposium on Security and Privacy", "Black Hat Arsenal", "Pwn2Own",
-        "تحقیقات فنی منتشرشده در Security Conferences", "PoCهای مهم و تحقیقات پشت آن‌ها", "تحقیقات جدید Vulnerability Research"
+    "MATHEMATICS": [
+        "Pure Mathematics", "Applied Mathematics", "Number Theory", "Algebra", "Analysis",
+        "Topology", "Geometry", "Discrete Mathematics", "Combinatorics", "Mathematical Logic",
+        "Category Theory", "Graph Theory", "Mathematical Physics", "Dynamical Systems",
+        "Mathematical Proofs", "Famous Mathematical Problems", "New Mathematical Discoveries"
     ],
-    "THREAT INTELLIGENCE / APT": [
-        "APT", "Advanced Persistent Threats", "Cyber Espionage", "State-Sponsored Cyber Operations",
-        "Government Cyber Operations", "Cyber Warfare", "Advanced Threat Campaigns", "تحلیل فنی کمپین‌های APT",
-        "تحلیل TTPهای جدید مهاجمان", "تحلیل ابزارها و malwareهای مورد استفاده گروه‌های APT"
+    "AI & MATHEMATICS": [
+        "Mathematical Foundations of AI", "Mathematical Foundations of Machine Learning",
+        "Learning Theory", "Optimization Theory", "Probability and Statistics for AI",
+        "Information Theory", "Linear Algebra for AI", "Algebraic Geometry in ML",
+        "Topological Data Analysis", "Geometric Deep Learning", "Mathematical AI Research",
+        "Theoretical Computer Science and AI"
+    ],
+    "AI SKEPTICISM / REALISM": [
+        "AI Limitations", "LLM Limitations", "AI Hype Criticism", "AI Reality Check",
+        "Skepticism about AGI", "AI Bubble Analysis", "Critical AI Analysis",
+        "AI Overclaiming", "AI Evaluation Challenges", "AI Benchmark Limitations",
+        "Empirical AI Analysis", "AI Scaling Laws Debate", "Rational AI Discourse"
+    ],
+    "SECURITY CONFERENCES": [
+        "Black Hat", "DEF CON", "USENIX Security", "NDSS", "IEEE S&P", "Pwn2Own",
+        "Security Conference Research"
+    ],
+    "THREAT INTEL / APT": [
+        "APT", "Cyber Espionage", "State-Sponsored Cyber Operations", "Cyber Warfare",
+        "APT Campaign Analysis", "TTP Analysis"
     ],
     "IRAN": [
-        "امنیت سایبری ایران", "تحقیقات امنیتی مرتبط با ایران", "حملات سایبری مرتبط با ایران با تحلیل فنی",
-        "گروه‌های تهدید ایرانی", "عملیات سایبری مرتبط با ایران", "زیرساخت‌های حیاتی ایران",
-        "تحولات فناوری ایران با اهمیت راهبردی", "سیاست فناوری ایران با اثر امنیتی یا راهبردی",
-        "تحریم‌های فناوری علیه ایران", "قوانین و مقررات فناوری ایران با اثر مهم",
-        "تحولات سیاسی و راهبردی ایران با اثر مستقیم بر فناوری یا امنیت"
+        "امنیت سایبری ایران", "حملات سایبری مرتبط با ایران", "گروه‌های تهدید ایرانی",
+        "زیرساخت‌های حیاتی ایران", "تحریم‌های فناوری علیه ایران", "تحولات راهبردی ایران"
     ],
     "CHINA": [
-        "China Cybersecurity", "China Cyber Operations", "Chinese APT Groups", "Chinese Cyber Espionage",
-        "Chinese Security Research", "تحقیقات امنیتی منتشرشده از چین", "فناوری چین با اهمیت راهبردی",
-        "صنعت فناوری چین", "شرکت‌های فناوری چینی با اهمیت راهبردی", "سیاست فناوری چین", "قوانین فناوری چین",
-        "رقابت فناوری چین و آمریکا", "تحریم‌های فناوری علیه چین", "رقابت تراشه و Semiconductor بین چین و آمریکا",
-        "تحولات AI چین با اهمیت راهبردی"
+        "China Cyber Operations", "Chinese APT Groups", "China Semiconductor",
+        "US-China Tech Competition", "China AI Strategy"
     ],
     "MIDDLE EAST / ISRAEL": [
-        "تحولات راهبردی خاورمیانه", "امنیت سایبری خاورمیانه", "عملیات سایبری در خاورمیانه",
-        "Israel Cybersecurity", "Israeli Cybersecurity Industry", "Israeli Cyber Operations",
-        "Israeli Security Research", "روابط ایران و اسرائیل", "تحولات امنیتی منطقه با اهمیت راهبردی"
+        "Middle East Cybersecurity", "Israel Cyber Operations", "Iran-Israel Cyber Conflict",
+        "Regional Strategic Security"
     ],
-    "UNITED STATES / NATIONAL SECURITY": [
-        "US National Security Technology", "US Cybersecurity Policy", "CISA", "US Cybersecurity Regulation",
-        "US Technology Policy", "US National Security Policy", "Technology Export Controls",
-        "Semiconductor Export Controls", "Technology Sanctions", "AI Regulation با اهمیت راهبردی", "Cybersecurity Regulation با اثر مهم"
+    "US NATIONAL SECURITY": [
+        "US Cybersecurity Policy", "CISA", "Technology Export Controls",
+        "Semiconductor Sanctions", "AI Regulation"
     ],
-    "STRATEGIC TECHNOLOGY": [
-        "Technology Competition", "US-China Technology Competition", "Semiconductor Industry",
-        "Advanced Semiconductor Technology", "Chip Design", "Chip Manufacturing", "AI Hardware",
-        "GPU Architecture", "Accelerator Architecture", "Strategic Technology", "تحولات فناوری با اثر ژئوپلیتیکی",
-        "رقابت فناوری بین قدرت‌های جهانی"
+    "STRATEGIC TECH": [
+        "Semiconductor Industry", "Chip Design/Manufacturing", "AI Hardware",
+        "GPU Architecture", "Geopolitical Technology Competition"
     ],
-    "CYBERSECURITY INDUSTRY / PRODUCTS": [
-        "Cybersecurity Startups با فناوری متمایز", "محصولات جدید Cybersecurity با نوآوری فنی",
-        "EDR/XDR Products", "Endpoint Security Products", "Threat Intelligence Products",
-        "Security Research Companies", "Exploit Development Companies", "Vulnerability Research Companies",
-        "Malware Analysis Companies", "Security Product Acquisitions", "Cybersecurity Funding در شرکت‌های دارای فناوری قابل توجه",
-        "فناوری‌های امنیتی جدید با قابلیت ایجاد محصول"
+    "CYBERSECURITY INDUSTRY": [
+        "Cybersecurity Startups", "EDR/XDR Products", "Security Research Companies",
+        "Vulnerability Research Companies", "Security Funding"
     ],
-    "ANALYTICAL / DEEP TECHNICAL CONTENT": [
-        "Technical Deep Dive", "تحلیل‌های فنی عمیق", "تحلیل فنی حملات سایبری", "Post-Mortem حملات سایبری",
-        "Root Cause Analysis", "تحلیل معماری سیستم‌های امنیتی", "تحلیل تکنیک‌های غیرمعمول در امنیت",
-        "تکنیک‌های خلاقانه و غیرمعمول در امنیت", "تحقیقات عجیب و جالب Computer Science",
-        "پروژه‌های غیرمعمول و جالب در سیستم‌ها", "تحقیقات جدید که یک تکنیک یا ایده فنی جدید معرفی می‌کنند"
+    "DEEP TECHNICAL CONTENT": [
+        "Technical Deep Dive", "Post-Mortem Attacks", "Root Cause Analysis",
+        "Unusual Security Techniques", "Creative Systems Projects"
     ]
 }
 
@@ -180,11 +161,9 @@ def clean_html(raw_html):
     return ' '.join(cleantext.split()).strip()
 
 def build_interests_prompt():
-    """ساخت پرامپت کامل از لیست علاقه‌مندی‌ها"""
-    prompt_parts = ["حوزه‌های مورد علاقه کاربر (اگر خبر در یکی از این دسته‌ها قرار می‌گیرد، تایید کن):"]
+    prompt_parts = []
     for category, interests in INTEREST_CATEGORIES.items():
-        prompt_parts.append(f"\n{category}:")
-        prompt_parts.append(", ".join(interests))
+        prompt_parts.append(f"{category}: {', '.join(interests)}")
     return "\n".join(prompt_parts)
 
 INTERESTS_PROMPT = build_interests_prompt()
@@ -197,16 +176,39 @@ def fetch_single_feed(feed):
         response = requests.get(feed_url, headers=headers, timeout=TIMEOUT)
         feed_data = feedparser.parse(response.content)
         return feed_data.entries[:POSTS_PER_FEED]
-    except Exception as e:
+    except:
         return []
 
 def is_recent(entry, max_age_days=MAX_AGE_DAYS):
-    """بررسی می‌کند که پست در بازه زمانی مجاز باشد"""
     published_parsed = entry.get('published_parsed') or entry.get('updated_parsed')
     if not published_parsed:
-        return True  # اگر تاریخ وجود نداشت، پردازش شود
+        return True
     published_date = datetime(*published_parsed[:6])
     return datetime.utcnow() - published_date <= timedelta(days=max_age_days)
+
+def parse_ai_response(ai_result):
+    """پارس کردن پاسخ هوش مصنوعی با عبارات منظم برای انعطاف‌پذیری بیشتر"""
+    if not ai_result:
+        return None
+    
+    if "REJECT" in ai_result.upper() and "CATEGORY" not in ai_result.upper():
+        return None
+    
+    try:
+        cat_match = re.search(r'CATEGORY\s*:\s*(.+)', ai_result, re.IGNORECASE)
+        title_match = re.search(r'TITLE\s*:\s*(.+)', ai_result, re.IGNORECASE)
+        summary_match = re.search(r'SUMMARY\s*:\s*(.+)', ai_result, re.IGNORECASE | re.DOTALL)
+        
+        if cat_match and title_match and summary_match:
+            return {
+                "category": cat_match.group(1).strip(),
+                "title": title_match.group(1).strip(),
+                "summary": summary_match.group(1).strip()
+            }
+    except Exception as e:
+        print(f"    [-] Regex parse error: {e}")
+    
+    return None
 
 def analyze_with_gemini(title, summary):
     if not client: return "REJECT"
@@ -215,37 +217,36 @@ def analyze_with_gemini(title, summary):
     clean_summary = clean_html(summary)
     if len(clean_summary) > 3000: clean_summary = clean_summary[:3000]
 
-    prompt = f"""تو یک تحلیلگر ارشد امنیت سایبری، پژوهشگر سیستم‌های سطح پایین و ژئوپلیتیک فناوری هستی.
-وظیفه تو فیلتر کردن اخبار RSS بر اساس لیست دقیق علاقه‌مندی‌های کاربر است.
+    prompt = f"""تو یک تحلیلگر ارشد امنیت سایبری، پژوهشگر ریاضیات و ژئوپلیتیک فناوری هستی. وظیفه تو فیلتر کردن اخبار زیر بر اساس علاقه‌مندی‌های کاربر است.
 
+حوزه‌های مورد علاقه کاربر:
 {INTERESTS_PROMPT}
 
-قوانین تایید (ACCEPT):
-- اخبار دارای تحلیل فنی عمیق (Deep Dive)، معرفی تکنیک‌های جدید، یا تحقیقات مرتبط با دسته‌های بالا.
-- کشف آسیب‌پذیری‌های مهم، گزارش‌های Threat Intel، تحولات راهبردی فناوری، و مقالات کنفرانس‌ها.
-- اخبار مرتبط با ایران، چین، اسرائیل، خاورمیانه، و رقابت‌های ژئوپلیتیک فناوری.
+خبر زیر را ارزیابی کن:
+عنوان: {clean_title}
+خلاصه: {clean_summary}
 
-قوانین رد (REJECT):
-- اخبار عمومی IT، بازاریابی محصولات، اعلامیه‌های CVE بدون تحلیل، اخبار بورس، و موارد نامرتبط با لیست بالا.
+قوانین:
+- اگر خبر به هر یک از حوزه‌های بالا مرتبط است، آن را تایید کن.
+- اگر خبر کاملاً نامرتبط است، رد کن.
+- اگر شک داری، خبر را تایید کن (ترجیحاً خبر مرتبط را از دست نده).
 
-عنوان خبر: {clean_title}
-خلاصه خبر: {clean_summary}
+مثال خروجی تایید شده:
+CATEGORY: THREAT INTEL / APT
+TITLE: تحلیل فنی کمپین جدید جاسوسی سایبری علیه خاورمیانه
+SUMMARY: این گزارش یک کمپین جدید جاسوسی سایبری را با استفاده از تکنیک‌های Living-off-the-Land تحلیل می‌کند.
 
-خروجی:
-اگر خبر مرتبط است، دقیقاً این فرمت را برگردان:
-CATEGORY: [نام دقیق‌ترین دسته مرتبط از لیست بالا]
-TITLE: [ترجمه جذاب و حرفه‌ای عنوان به فارسی]
-SUMMARY: [خلاصه فنی و مفید در ۲-۳ جمله به فارسی روان]
-
-اگر خبر مرتبط نیست، فقط و فقط یک کلمه برگردان:
+مثال خروجی رد شده:
 REJECT
+
+خروجی تو باید دقیقاً یکی از دو فرمت بالا باشد. اگر خبر مرتبط است، فرمت کامل را برگردان:
 """
 
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.3),
+            config=types.GenerateContentConfig(temperature=0.5),
         )
         return response.text.strip()
     except Exception as e:
@@ -276,7 +277,6 @@ def main():
             entries = future.result()
             all_entries.extend(entries)
 
-    # فیلتر کردن پست‌های تکراری و قدیمی قبل از پردازش با Gemini
     unique_entries = []
     skipped_old = 0
     skipped_seen = 0
@@ -292,7 +292,7 @@ def main():
             
         if not is_recent(entry):
             skipped_old += 1
-            new_seen_ids.add(post_id)  # به عنوان دیده‌شده علامت‌گذاری می‌شود تا دیگر پردازش نشود
+            new_seen_ids.add(post_id)
             continue
             
         unique_entries.append(entry)
@@ -312,6 +312,7 @@ def main():
 
     sent_count = 0
     rejected_count = 0
+    parse_errors = 0
 
     for i, entry in enumerate(unique_entries):
         title = entry.get("title", "").strip()
@@ -320,26 +321,27 @@ def main():
         print(f"  [{i+1}/{len(unique_entries)}] {title[:50]}...")
         
         ai_result = analyze_with_gemini(title, summary)
+        parsed = parse_ai_response(ai_result)
         
-        if "REJECT" not in ai_result and "CATEGORY:" in ai_result:
+        if parsed:
             try:
-                lines = ai_result.split("\n")
-                cat = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("CATEGORY:")), "")
-                title_fa = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("TITLE:")), "")
-                summary_fa = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("SUMMARY:")), "")
-                
-                if cat and title_fa and summary_fa:
-                    send_telegram(title_fa, summary_fa, entry.get("link", ""), cat)
-                    sent_count += 1
-                    time.sleep(0.2)  # تأخیر کوتاه برای تلگرام
+                send_telegram(
+                    parsed["title"],
+                    parsed["summary"],
+                    entry.get("link", ""),
+                    parsed["category"]
+                )
+                sent_count += 1
+                time.sleep(0.2)
             except Exception as e:
-                print(f"    [-] Parse error: {e}")
+                print(f"    [-] Send error: {e}")
+                parse_errors += 1
         else:
-            if rejected_count < 10:  # لاگ ۱۰ نمونه اول برای دیباگ
-                print(f"  [DEBUG REJECT] Title: {title[:60]} | AI Output: {ai_result[:100]}")
+            if rejected_count < 50:
+                print(f"  [DEBUG REJECT] Title: {title[:60]} | AI Output: {ai_result[:150]}")
             rejected_count += 1
         
-        time.sleep(GEMINI_DELAY)  # تأخیر برای جلوگیری از Rate Limit Gemini
+        time.sleep(GEMINI_DELAY)
 
     save_seen_ids(new_seen_ids)
     
@@ -348,7 +350,8 @@ def main():
         f"✅ **پایان اجرا در {elapsed} ثانیه.**\n"
         f"▫️ پست‌های جدید بررسی‌شده: {len(unique_entries)}\n"
         f"▫️ تایید و ارسال‌شده: {sent_count}\n"
-        f"▫️ رد شده: {rejected_count}"
+        f"▫️ رد شده: {rejected_count}\n"
+        f"▫️ خطاهای پارس: {parse_errors}"
     )
     send_status_message(status_summary)
 
