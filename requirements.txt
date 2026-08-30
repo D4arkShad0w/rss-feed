@@ -4,6 +4,6 @@ listparser
 beautifulsoup4
 urllib3
 google-genai
-groq
+openai
 httpx
-cloudscraper
+curl_cffi
