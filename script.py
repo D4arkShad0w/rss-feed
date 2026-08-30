@@ -1,9 +1,12 @@
 """
-RSS Security News Bot - Final Edition v5
+RSS Security News Bot - Final Edition v6
 ==========================================
-۱. ETag/Last-Modified — Conditional GET (۳۰۴ = بدون محتوا، سریع، بدون فشار)
+۱. ETag/Last-Modified — Conditional GET (304 = بدون محتوا، سریع)
 ۲. FEED_TIMEOUT=15 + MAX_WORKERS=8 — سریع‌تر ولی پایدار
-۳. State Cleanup — حذف entries قدیمی، cap روی حجم فایل
+۳. State Cleanup — حذف entries قدیمی، cap حجم
+۴. Markdown → HTML با پاک‌سازی ** اورفان
+۵. Auto-Delete پیام‌های وضعیت بعد از ۲ دقیقه
+۶. بدون پیام "شروع"
 """
 
 from __future__ import annotations
@@ -60,7 +63,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OPML_FILE = "feeds.opml"
 STATE_FILE = "seen_ids.json"
 
-MAX_WORKERS = 8                # ✅ 8 (بود 5)
+MAX_WORKERS = 8
 POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "100"))
 MAX_UNDATED_ENTRIES_PER_FEED = 3
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
@@ -68,7 +71,7 @@ FUTURE_TOLERANCE = timedelta(hours=6)
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 MAX_ENTRIES_PER_RUN = int(os.getenv("MAX_ENTRIES_PER_RUN", "100"))
 
-FEED_TIMEOUT = 15             # ✅ 15 (بود 30) — با ETag اکثر فیدها ۳۰۴ سریع
+FEED_TIMEOUT = 15
 ARTICLE_TIMEOUT = 20
 TELEGRAM_TIMEOUT = 10
 GEMINI_DELAY = 5.0
@@ -76,9 +79,11 @@ MODEL_COOLDOWN_SECONDS = 1800
 TRANSIENT_COOLDOWN_SECONDS = 300
 TELEGRAM_MAX_LEN = 4096
 
-MAX_URL_VARIANTS = 10         # ✅ 10 (بود 20) — کمتر = سریع‌تر
+MAX_URL_VARIANTS = 10
 MAX_DISCOVERED_FEEDS = 5
-MAX_STATE_SIZE = 20000        # ✅ Cap: حداکثر ۲۰۰۰۰ entry در هر set
+MAX_STATE_SIZE = 20000
+
+AUTO_DELETE_DELAY = 120  # ✅ ۲ دقیقه
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -189,11 +194,9 @@ def build_session() -> requests.Session:
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     })
-    retry = Retry(
-        total=1, connect=1, read=1, backoff_factor=0.3,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "POST"]),
-    )
+    retry = Retry(total=1, connect=1, read=1, backoff_factor=0.3,
+                  status_forcelist=[500, 502, 503, 504],
+                  allowed_methods=frozenset(["GET", "POST"]))
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -234,7 +237,6 @@ def normalize_url(url: str) -> str:
     except Exception:
         return url
 
-# ✅ DNS Cache
 _dns_cache: Dict[str, Tuple[float, int]] = {}
 _dns_cache_ttl = 300
 
@@ -251,12 +253,9 @@ def check_dns(hostname: str) -> bool:
     except Exception:
         return False
 
-# ✅ 6-Layer fetch با ETag support
 def fetch_url(url: str, timeout: int, extra_headers: Optional[Dict] = None,
               allow_304: bool = False) -> Optional[requests.Response]:
     http = get_http()
-
-    # Layer 1: requests
     try:
         kwargs = {"timeout": timeout, "allow_redirects": True}
         if extra_headers:
@@ -274,8 +273,6 @@ def fetch_url(url: str, timeout: int, extra_headers: Optional[Dict] = None,
             logger.info("  [HTTP] SSL Error → bypass: %s", url)
         else:
             logger.info("  [HTTP] requests failed: %s | %s", url, error_msg[:80])
-
-    # Layer 2-5: curl_cffi
     for imp in ["chrome", "chrome120", "safari", "edge"]:
         try:
             kwargs = {"impersonate": imp, "timeout": timeout, "allow_redirects": True}
@@ -290,8 +287,6 @@ def fetch_url(url: str, timeout: int, extra_headers: Optional[Dict] = None,
                 return response
         except Exception:
             continue
-
-    # Layer 6: verify=False
     try:
         kwargs = {"timeout": timeout, "allow_redirects": True, "verify": False}
         if extra_headers:
@@ -304,7 +299,6 @@ def fetch_url(url: str, timeout: int, extra_headers: Optional[Dict] = None,
             return response
     except Exception as e:
         logger.warning("[FETCH] %s | ALL failed | %s", url, str(e)[:80])
-
     return None
 
 # ============================================================
@@ -334,11 +328,8 @@ else:
     logger.warning("GROQ_API_KEY missing or groq package not installed.")
 
 # ============================================================
-# STATE (با ETags + Timestamps + Cleanup)
+# STATE
 # ============================================================
-
-# ✅ State: seen/seen_urls/seen_titles = dict {id: timestamp}
-# ✅ etags = dict {url: {etag, last_modified, last_fetch}}
 
 def load_state() -> Tuple[Dict, Dict, Dict, Dict, Dict]:
     if not os.path.exists(STATE_FILE):
@@ -348,23 +339,17 @@ def load_state() -> Tuple[Dict, Dict, Dict, Dict, Dict]:
             data = json.load(f)
         if not isinstance(data, dict):
             return {}, {}, {}, {}, {}
-
-        # ✅ Backward compat: list → dict
         seen = data.get("seen", {})
         if isinstance(seen, list):
             seen = {k: 0.0 for k in seen}
-
         seen_urls = data.get("seen_urls", {})
         if isinstance(seen_urls, list):
             seen_urls = {k: 0.0 for k in seen_urls}
-
         seen_titles = data.get("seen_titles", {})
         if isinstance(seen_titles, list):
             seen_titles = {k: 0.0 for k in seen_titles}
-
         etags = data.get("etags", {})
         retries = data.get("retries", {})
-
         return seen, retries, seen_urls, seen_titles, etags
     except Exception as e:
         logger.error("State load error: %s", e)
@@ -374,34 +359,26 @@ def save_state(seen: Dict, retries: Dict, seen_urls: Dict,
                seen_titles: Dict, etags: Dict) -> None:
     try:
         temp = STATE_FILE + ".tmp"
-        payload = {
-            "seen": seen,
-            "retries": retries,
-            "seen_urls": seen_urls,
-            "seen_titles": seen_titles,
-            "etags": etags,
-        }
+        payload = {"seen": seen, "retries": retries, "seen_urls": seen_urls,
+                   "seen_titles": seen_titles, "etags": etags}
         with open(temp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(temp, STATE_FILE)
     except Exception as e:
         logger.error("State save error: %s", e)
 
-# ✅ Cleanup — حذف entries قدیمی + cap حجم
 def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
                   seen_titles: Dict, etags: Dict
                   ) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
     now = time.time()
-    max_age = (MAX_AGE_DAYS * 2) * 86400  # ۱۴ روز
+    max_age = (MAX_AGE_DAYS * 2) * 86400
 
     def clean_dict(d: Dict, name: str) -> Dict:
-        # حذف by age
         old = [k for k, v in d.items() if isinstance(v, (int, float)) and now - v > max_age]
         for k in old:
             del d[k]
         if old:
             logger.info("[CLEANUP] %s: removed %d old (kept %d)", name, len(old), len(d))
-        # cap by size
         if len(d) > MAX_STATE_SIZE:
             if all(isinstance(v, (int, float)) for v in d.values()):
                 sorted_items = sorted(d.items(), key=lambda x: x[1], reverse=True)
@@ -415,7 +392,6 @@ def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
     seen_urls = clean_dict(seen_urls, "seen_urls")
     seen_titles = clean_dict(seen_titles, "seen_titles")
 
-    # Clean etags (entries not fetched in 30 days)
     old_etags = [k for k, v in etags.items()
                  if now - v.get("last_fetch", 0) > 30 * 86400]
     for k in old_etags:
@@ -423,11 +399,9 @@ def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
     if old_etags:
         logger.info("[CLEANUP] etags: removed %d old (kept %d)", len(old_etags), len(etags))
 
-    # Clean retries
     if len(retries) > 500:
         sorted_r = sorted(retries.items(), key=lambda x: x[1], reverse=True)
         retries = dict(sorted_r[:200])
-        logger.info("[CLEANUP] retries: capped to 200")
 
     return seen, retries, seen_urls, seen_titles, etags
 
@@ -456,13 +430,16 @@ def markdown_to_html(text: str) -> str:
         return ""
     text = re.sub(r"```[\w]*\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-    text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
-    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"<i>\1</i>", text, flags=re.DOTALL)
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+    # ✅ پاک‌سازی ** و * اورفان
+    text = text.replace("**", "")
+    text = re.sub(r"(?<!\w)\*(?!\d)", "", text)
     return text.strip()
 
 def strip_markdown(text: str) -> str:
@@ -470,35 +447,57 @@ def strip_markdown(text: str) -> str:
         return ""
     text = re.sub(r"```[\w]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"__(.+?)__", r"\1", text)
-    text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", text)
-    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"\1", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"\1", text, flags=re.DOTALL)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = text.replace("**", "")
     return text.strip()
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM (با Auto-Delete)
 # ============================================================
 
-def _post_telegram(payload: Dict[str, Any]) -> bool:
+def _post_telegram(payload: Dict[str, Any], auto_delete: bool = False) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         response = get_http().post(url, json=payload, timeout=TELEGRAM_TIMEOUT)
         if response.ok:
+            if auto_delete:
+                try:
+                    result = response.json()
+                    message_id = result.get("result", {}).get("message_id")
+                    if message_id:
+                        threading.Thread(
+                            target=_delete_message_after_delay,
+                            args=(message_id, AUTO_DELETE_DELAY),
+                            daemon=True
+                        ).start()
+                except Exception:
+                    pass
             return True
         logger.error("Telegram error: %s %s", response.status_code, response.text[:500])
     except Exception as e:
         logger.error("Telegram exception: %s", e)
     return False
 
+def _delete_message_after_delay(message_id: int, delay: int) -> None:
+    time.sleep(delay)
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    try:
+        get_http().post(url, json={"chat_id": CHAT_ID, "message_id": message_id}, timeout=TELEGRAM_TIMEOUT)
+        logger.info("Auto-deleted status message %d after %ds", message_id, delay)
+    except Exception as e:
+        logger.warning("Auto-delete failed: %s", e)
+
 def send_status_message(text: str) -> bool:
     if len(text) > 4000:
         text = text[:4000] + "\n... (Truncated)"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_notification": True}
-    return _post_telegram(payload)
+    return _post_telegram(payload, auto_delete=True)
 
 def send_telegram(title: str, analysis: str, link: str, category: str, source: str = "") -> bool:
     if not BOT_TOKEN or not CHAT_ID:
@@ -524,7 +523,7 @@ def send_telegram(title: str, analysis: str, link: str, category: str, source: s
         text = build(trimmed)
 
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
-    ok = _post_telegram(payload)
+    ok = _post_telegram(payload, auto_delete=False)
     if ok:
         logger.info("Telegram message sent.")
     return ok
@@ -538,7 +537,6 @@ def generate_url_variants(url: str) -> List[str]:
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path.rstrip("/")
-
     if "sympoium" in url:
         variants.append(url.replace("sympoium", "symposium"))
     if "rsshub.app" in url:
@@ -563,7 +561,6 @@ def generate_url_variants(url: str) -> List[str]:
         variants.append(url.replace("://www.", "://", 1))
     if path.endswith(".xml"):
         variants.append(base + path[:-4])
-
     seen = set()
     unique = []
     for v in variants:
@@ -661,16 +658,12 @@ def filter_entries_by_date(entries: List[Any]) -> List[Any]:
         undated = undated[:MAX_UNDATED_ENTRIES_PER_FEED]
     return dated + undated
 
-# ✅ try_fetch_feed_url با ETag
 def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
-    """Returns (entries, changed). changed=False means 304 Not Modified."""
-    # DNS pre-check
     parsed = urlparse(url)
     hostname = parsed.netloc.split(":")[0]
     if not check_dns(hostname):
         return [], False
 
-    # ✅ ETag headers
     etag_data = etags.get(url, {})
     extra_headers = {}
     if etag_data.get("etag"):
@@ -685,37 +678,27 @@ def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
     if not response:
         return [], False
 
-    # ✅ 304 Not Modified — تغییری ندارد
     if response.status_code == 304:
         logger.info("  [FEED] 304 Not Modified: %s", url)
-        etags[url]["last_fetch"] = time.time()
+        if url in etags:
+            etags[url]["last_fetch"] = time.time()
         return [], False
 
-    # ✅ 200 — محتوای جدید
     if response.status_code == 200:
-        # ذخیره ETag جدید
         new_etag = response.headers.get("ETag")
         new_lm = response.headers.get("Last-Modified")
-        etags[url] = {
-            "etag": new_etag,
-            "last_modified": new_lm,
-            "last_fetch": time.time(),
-        }
+        etags[url] = {"etag": new_etag, "last_modified": new_lm, "last_fetch": time.time()}
 
     parsed_feed = feedparser.parse(response.content)
     if parsed_feed.entries:
         logger.info("  [FEED] ✅ feedparser: %d entries: %s", len(parsed_feed.entries), url)
         return parsed_feed.entries[:POSTS_PER_FEED], True
 
-    ct = response.headers.get("content-type", "unknown")
-    logger.info("  [FEED] 0 entries | CT: %s | %d bytes: %s", ct[:30], len(response.content), url)
-
     content_preview = response.text[:500].strip()
     is_xml = any(tag in content_preview.lower() for tag in ["<?xml", "<rss", "<feed", "<channel", "<entry"])
     if is_xml:
         return [], False
 
-    # RSS Discovery
     discovered = discover_rss_feeds(response.text, url)
     for rss_url in discovered:
         if normalize_url(rss_url) == normalize_url(url):
@@ -727,7 +710,6 @@ def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
                 logger.info("  [DISCOVERY] ✅ Found RSS: %s", rss_url)
                 return rss_parsed.entries[:POSTS_PER_FEED], True
 
-    # Site Scraping
     scraped = scrape_site_articles(response.text, url)
     if scraped:
         return scraped[:POSTS_PER_FEED], True
@@ -739,21 +721,17 @@ def fetch_single_feed(feed: Any, etags: Dict) -> Tuple[List[Any], bool]:
     if not feed_url or not is_safe_url(feed_url):
         return [], False
     try:
-        # ✅ Retry: ۲ بار
         for attempt in range(2):
             entries, changed = try_fetch_feed_url(feed_url, etags)
             if entries:
                 entries = filter_entries_by_date(entries)
                 return entries[:POSTS_PER_FEED], True
             if attempt == 0 and not changed:
-                # 304 = no change, no retry needed
-                if not changed:
-                    return [], True  # ✅ True = feed is OK, just no new content
+                return [], True
             elif attempt == 0:
                 logger.info("  [FEED] Retry in 2s: %s", feed_url)
                 time.sleep(2)
 
-        # URL Variants
         variants = generate_url_variants(feed_url)
         for variant_url in variants:
             entries, _ = try_fetch_feed_url(variant_url, etags)
@@ -1177,16 +1155,14 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 def main() -> None:
     start = time.time()
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v5 - ETag)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v6)")
     logger.info("=" * 70)
     logger.info("BOT_TOKEN: %s", "OK" if BOT_TOKEN else "MISSING")
     logger.info("GROQ_API_KEY: %s", "OK" if GROQ_API_KEY else "MISSING")
     logger.info("GEMINI_API_KEY: %s", "OK" if GEMINI_API_KEY else "MISSING")
 
     if not gemini_client and not groq_client:
-        msg = "No AI provider configured."
-        logger.error(msg)
-        send_status_message(f"❌ {msg}")
+        logger.error("No AI provider configured.")
         return
 
     if not os.path.exists(OPML_FILE):
@@ -1204,7 +1180,6 @@ def main() -> None:
     feeds = parsed.feeds
     logger.info("Feeds loaded: %d", len(feeds))
 
-    # ✅ Load + Cleanup state
     seen, retry_counts, seen_urls, seen_titles, etags = load_state()
     seen, retry_counts, seen_urls, seen_titles, etags = cleanup_state(
         seen, retry_counts, seen_urls, seen_titles, etags
@@ -1212,13 +1187,7 @@ def main() -> None:
     logger.info("State: %d IDs | %d URLs | %d titles | %d etags | %d retries",
                 len(seen), len(seen_urls), len(seen_titles), len(etags), len(retry_counts))
 
-    # ✅ پیام فوری "شروع"
-    send_status_message(
-        f"🔄 *ربات شروع کرد*\n\n"
-        f"▫️ فیدها: {len(feeds)}\n"
-        f"▫️ State: {len(seen)} IDs | {len(etags)} etags\n"
-        f"▫️ زمان: {datetime.now().strftime('%H:%M')}"
-    )
+    # ✅ بدون پیام "شروع" — مستقیماً fetch شروع می‌شود
 
     all_entries: List[Any] = []
     successful_feeds = 0
@@ -1243,7 +1212,6 @@ def main() -> None:
     logger.info("Successful feeds: %d/%d (fetch: %ss)", successful_feeds, len(feeds), fetch_time)
     logger.info("Downloaded entries: %d", len(all_entries))
 
-    # ✅ Triple Dedup (seen/seen_urls/seen_titles are dicts)
     candidates: List[Tuple[str, Any]] = []
     current_ids: Set[str] = set()
     current_urls: Set[str] = set()
@@ -1357,7 +1325,6 @@ def main() -> None:
 
         time.sleep(GEMINI_DELAY)
 
-    # ✅ Save state with timestamps
     for item in successfully_processed:
         seen[item] = time.time()
     for url in new_urls:
