@@ -1,16 +1,16 @@
 """
-RSS Security News Bot - Final Edition v9
+RSS Security News Bot - Final Edition v10
 ==========================================
-۱. is_recent: بدون تاریخ → True (پردازش می‌شوند)
-۲. MAX_UNDATED_ENTRIES_PER_FEED = 3 (برای RSS عادی)
-۳. MAX_UNDATED_ENTRIES_HTML_FEED = 1 (برای HTML feeds مثل Digital Whisper)
-۴. تشخیص HTML vs XML → محدود کردن هوشمند undated entries
-۵. ETag + Thread-Local + 6-Layer fetch
-۶. Cleanup: فقط cap by size (50000)
-۷. Markdown → HTML با پاک‌سازی ** اورفان
-۸. Auto-Delete پیام‌های وضعیت (sync_delete برای پایان)
-۹. link_preview_options با prefer_large_media
-۱۰. Prompt: مطلقاً نام‌های خاص ترجمه نشود
+۱. حذف [اخبار منتخب] از پیام‌های مقاله
+۲. RTL Fix: RLM (U+200F) در ابتدای خطوط فارسی — کلمات انگلیسی جابجا نمی‌شوند
+۳. پیام پایان: مدل‌های AI استفاده‌شده + مدل‌های cooldown
+۴. is_recent: بدون تاریخ → True
+۵. MAX_UNDATED_HTML=1 / MAX_UNDATED_RSS=3
+۶. ETag + Thread-Local + 6-Layer fetch
+۷. Cleanup: فقط cap by size (50000)
+۸. Markdown → HTML با پاک‌سازی ** اورفان
+۹. Auto-Delete پیام‌های وضعیت (sync_delete برای پایان)
+۱۰. link_preview_options + Prompt: نام‌های خاص ترجمه نشود
 """
 
 from __future__ import annotations
@@ -69,8 +69,8 @@ STATE_FILE = "seen_ids.json"
 
 MAX_WORKERS = 8
 POSTS_PER_FEED = int(os.getenv("POSTS_PER_FEED", "100"))
-MAX_UNDATED_ENTRIES_PER_FEED = 3     # ✅ برای RSS عادی
-MAX_UNDATED_ENTRIES_HTML_FEED = 1    # ✅ برای HTML feeds (Digital Whisper)
+MAX_UNDATED_ENTRIES_PER_FEED = 3     # برای RSS عادی
+MAX_UNDATED_ENTRIES_HTML_FEED = 1    # برای HTML feeds (Digital Whisper)
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
 FUTURE_TOLERANCE = timedelta(hours=6)
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
@@ -89,6 +89,10 @@ MAX_DISCOVERED_FEEDS = 5
 MAX_STATE_SIZE = 50000
 
 AUTO_DELETE_DELAY = 120
+
+# ✅ RTL Fix
+RLM = "\u200f"  # Right-to-Left Mark
+RTL_PATTERN = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -117,13 +121,17 @@ ANALYSIS_MODELS = [
 ]
 
 # ============================================================
-# MODEL COOLDOWN
+# MODEL COOLDOWN + USAGE TRACKING
 # ============================================================
 
 class NoModelsAvailable(RuntimeError):
     pass
 
 model_error_state: Dict[str, Tuple[float, int]] = {}
+
+# ✅ Tracking برای پیام پایان
+model_usage: Dict[str, int] = {}          # {model_key: count}
+models_cooldown_run: Set[str] = set()     # مدل‌هایی که این run در cooldown رفتند
 
 def is_transient_error(reason: str) -> bool:
     r = reason.lower()
@@ -148,11 +156,17 @@ def mark_model_error(model_key: str, reason: str = "") -> None:
     cooldown = cooldown_for(reason)
     if cooldown == 0:
         return
+    # ✅ ثبت در cooldown های این run
+    models_cooldown_run.add(model_key)
     model_error_state[model_key] = (time.time(), cooldown)
     if "connection" in reason.lower():
         provider = model_key.split("/", 1)[0]
         model_error_state[f"__provider__/{provider}"] = (time.time(), cooldown)
     logger.warning("[COOLDOWN] %s for %d min%s", model_key, cooldown // 60, f" — {reason[:300]}" if reason else "")
+
+def record_model_usage(model_key: str) -> None:
+    """ثبت موفقیت یک مدل برای آمار پایانی."""
+    model_usage[model_key] = model_usage.get(model_key, 0) + 1
 
 # ============================================================
 # INTERESTS
@@ -181,78 +195,11 @@ INTEREST_CATEGORIES: Dict[str, List[str]] = {
     "STRATEGIC TECH": ["Semiconductor Industry", "Chip Design/Manufacturing", "AI Hardware", "GPU Architecture", "Geopolitical Technology Competition"],
     "CYBERSECURITY INDUSTRY": ["Cybersecurity Startups", "EDR/XDR Products", "Security Research Companies", "Vulnerability Research Companies", "Security Funding"],
     "DEEP TECHNICAL CONTENT": ["Technical Deep Dive", "Post-Mortem Attacks", "Root Cause Analysis", "Unusual Security Techniques", "Creative Systems Projects"],
-        "HARDWARE / SDR / IOT": [
-        "Hardware Hacking", "Software Defined Radio", "SDR",
-        "Radiosonde Tracking", "SondeHub", "ADS-B",
-        "RFID Security", "NFC Hacking", "Wireless Security",
-        "IoT Security", "Embedded Systems Security",
-        "Signals Intelligence", "SIGINT",
-        "Radio Frequency Security", "RF Security",
-        "Satellite Communications", "Satellite Tracking",
-        "GPS Spoofing", "Wireless Protocols",
-    ],
-    "WARFARE & MILITARY": [
-        "Modern Warfare", "Cyber Warfare", "Military Strategy",
-        "Defense Technology", "Military Innovation",
-        "Drone Warfare", "Autonomous Weapons",
-        "Electronic Warfare", "Information Warfare",
-        "Military AI", "Defense Industry",
-        "Arms Control", "Nuclear Strategy",
-        "Naval Warfare", "Air Warfare", "Space Warfare",
-        "Military Exercises", "Military Modernization",
-        "Defense Procurement", "Military Alliances",
-        "Asymmetric Warfare", "Hybrid Warfare",
-        "Covert Operations", "Special Operations",
-        "Military Intelligence", "War Analysis",
-        "Conflict Studies", "Defense Strategy",
-        "Munitions", "Weapons Systems",
-        "Battlefield Technology", "Combat Systems",
-    ],
-    "GOVERNANCE & STATECRAFT": [
-        "Governance", "Statecraft", "Public Policy",
-        "Regulatory Frameworks", "Government Technology",
-        "Digital Government", "E-Governance",
-        "Policy Analysis", "Institutional Reform",
-        "Public Administration", "Civic Technology",
-        "GovTech", "Smart Cities",
-        "Digital Transformation", "Government Innovation",
-        "Rule of Law", "Institutional Design",
-        "Sovereignty", "National Resilience",
-        "Crisis Management", "Emergency Response",
-        "National Security Strategy", "State Capability",
-        "Bureaucracy", "Administrative Reform",
-    ],
-    "STRATEGIC AFFAIRS": [
-        "Grand Strategy", "Geopolitical Strategy", "Strategic Competition",
-        "Great Power Competition", "Strategic Posture",
-        "Deterrence Theory", "Balance of Power",
-        "Strategic Stability", "Arms Race Dynamics",
-        "Strategic Partnerships", "Strategic Autonomy",
-        "National Power", "Strategic Resources",
-        "Global Order", "International System",
-        "Multipolarity", "Strategic Realism",
-        "Geopolitics", "Geostrategy",
-        "Sphere of Influence", "Containment Strategy",
-        "Power Projection", "Strategic Dilemmas",
-        "Threat Assessment", "Strategic Forecasting",
-        "Military Doctrine", "National Security Doctrine",
-    ],
-    "FUTUROLOGY & LONG-TERM VISION": [
-        "Futurology", "Long-term Forecasting", "Strategic Foresight",
-        "Civilizational Analysis", "Demographic Trends",
-        "Technological Singularity", "Post-Scarcity Economics",
-        "Climate Geopolitics", "Resource Futures",
-        "Space Exploration", "Mars Colonization",
-        "Transhumanism", "AI Convergence",
-        "Digital Sovereignty", "Technological Sovereignty",
-        "Long-term Risk Assessment", "Existential Risk",
-        "Civilizational Resilience", "Future of Warfare",
-        "Technological Disruption", "Paradigm Shifts",
-        "Long-wave Theory", "Historical Cycles",
-        "Clash of Civilizations", "End of History",
-        "Post-human Future", "Kardashev Scale",
-        "Great Filter", "Fermi Paradox",
-    ],
+    "HARDWARE / SDR / IOT": ["Hardware Hacking", "Software Defined Radio", "SDR", "Radiosonde Tracking", "SondeHub", "ADS-B", "RFID Security", "NFC Hacking", "Wireless Security", "IoT Security", "Embedded Systems Security", "Signals Intelligence", "SIGINT", "Radio Frequency Security", "RF Security", "Satellite Communications", "Satellite Tracking", "GPS Spoofing", "Wireless Protocols"],
+    "WARFARE & MILITARY": ["Modern Warfare", "Cyber Warfare", "Military Strategy", "Defense Technology", "Military Innovation", "Drone Warfare", "Autonomous Weapons", "Electronic Warfare", "Information Warfare", "Military AI", "Defense Industry", "Arms Control", "Nuclear Strategy", "Naval Warfare", "Air Warfare", "Space Warfare", "Military Exercises", "Military Modernization", "Defense Procurement", "Military Alliances", "Asymmetric Warfare", "Hybrid Warfare", "Covert Operations", "Special Operations", "Military Intelligence", "War Analysis", "Conflict Studies", "Defense Strategy", "Munitions", "Weapons Systems", "Battlefield Technology", "Combat Systems"],
+    "GOVERNANCE & STATECRAFT": ["Governance", "Statecraft", "Public Policy", "Regulatory Frameworks", "Government Technology", "Digital Government", "E-Governance", "Policy Analysis", "Institutional Reform", "Public Administration", "Civic Technology", "GovTech", "Smart Cities", "Digital Transformation", "Government Innovation", "Rule of Law", "Institutional Design", "Sovereignty", "National Resilience", "Crisis Management", "Emergency Response", "National Security Strategy", "State Capability", "Bureaucracy", "Administrative Reform"],
+    "STRATEGIC AFFAIRS": ["Grand Strategy", "Geopolitical Strategy", "Strategic Competition", "Great Power Competition", "Strategic Posture", "Deterrence Theory", "Balance of Power", "Strategic Stability", "Arms Race Dynamics", "Strategic Partnerships", "Strategic Autonomy", "National Power", "Strategic Resources", "Global Order", "International System", "Multipolarity", "Strategic Realism", "Geopolitics", "Geostrategy", "Sphere of Influence", "Containment Strategy", "Power Projection", "Strategic Dilemmas", "Threat Assessment", "Strategic Forecasting", "Military Doctrine", "National Security Doctrine"],
+    "FUTUROLOGY & LONG-TERM VISION": ["Futurology", "Long-term Forecasting", "Strategic Foresight", "Civilizational Analysis", "Demographic Trends", "Technological Singularity", "Post-Scarcity Economics", "Climate Geopolitics", "Resource Futures", "Space Exploration", "Mars Colonization", "Transhumanism", "AI Convergence", "Digital Sovereignty", "Technological Sovereignty", "Long-term Risk Assessment", "Existential Risk", "Civilizational Resilience", "Future of Warfare", "Technological Disruption", "Paradigm Shifts", "Long-wave Theory", "Historical Cycles", "Clash of Civilizations", "End of History", "Post-human Future", "Kardashev Scale", "Great Filter", "Fermi Paradox"],
 }
 
 def build_interests_prompt() -> str:
@@ -472,7 +419,7 @@ def cleanup_state(seen: Dict, retries: Dict, seen_urls: Dict,
     return seen, retries, seen_urls, seen_titles, etags
 
 # ============================================================
-# TEXT CLEANING + MARKDOWN → HTML
+# TEXT CLEANING + MARKDOWN → HTML + RTL
 # ============================================================
 
 def clean_html(text: Any) -> str:
@@ -520,8 +467,23 @@ def strip_markdown(text: str) -> str:
     text = text.replace("**", "")
     return text.strip()
 
+# ✅ RTL Fix — RLM (U+200F) در ابتدای خطوط دارای متن فارسی
+def apply_rtl_marks(text: str) -> str:
+    """هر خطی که حاوی حروف فارسی/عربی است را با RLM شروع کن.
+    این کار direction پاراگراف را RTL قفل می‌کند و کلمات انگلیسی
+    (مثل Docker یا EDR) که ابتدای خط می‌آیند، جابجا نمی‌شوند."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    fixed = []
+    for line in lines:
+        if line and not line.startswith(RLM) and RTL_PATTERN.search(line):
+            line = RLM + line
+        fixed.append(line)
+    return "\n".join(fixed)
+
 # ============================================================
-# TELEGRAM (با Auto-Delete + sync_delete)
+# TELEGRAM (با Auto-Delete + sync_delete + RTL)
 # ============================================================
 
 def _post_telegram(payload: Dict[str, Any], auto_delete: bool = False,
@@ -566,28 +528,31 @@ def send_status_message(text: str, sync_delete: bool = False) -> bool:
                "disable_notification": True}
     return _post_telegram(payload, auto_delete=True, sync_delete=sync_delete)
 
-def send_telegram(title: str, analysis: str, link: str, category: str, source: str = "") -> bool:
+def send_telegram(title: str, analysis: str, link: str, source: str = "") -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         return False
     title_clean = strip_markdown(title)
     title_e = escape_html_text(title_clean)
     analysis_escaped = escape_html_text(analysis)
     analysis_html = markdown_to_html(analysis_escaped)
-    category_e = escape_html_text(category)
     source_e = escape_html_text(source)
     if not is_safe_url(link):
         link = "https://unsafe.sh"
     link_e = html.escape(link, quote=True)
 
+    # ✅ بدون [اخبار منتخب] — فقط عنوان + منبع + تحلیل + لینک
     def build(analysis_text: str) -> str:
         source_line = f"🌐 <b>منبع:</b> {source_e}\n\n" if source_e else ""
-        return (f"📌 <b>[{category_e}]</b>\n\n🔹 <b>{title_e}</b>\n\n{source_line}{analysis_text}\n\n🔗 <a href=\"{link_e}\">مطالعه مطلب اصلی</a>")
+        return (f"🔹 <b>{title_e}</b>\n\n{source_line}{analysis_text}\n\n🔗 <a href=\"{link_e}\">مطالعه مطلب اصلی</a>")
 
     text = build(analysis_html)
     if len(text) > TELEGRAM_MAX_LEN:
         overflow = len(text) - TELEGRAM_MAX_LEN + 20
         trimmed = analysis_html[:max(0, len(analysis_html) - overflow)] + "…"
         text = build(trimmed)
+
+    # ✅ RTL Fix — RLM در ابتدای خطوط فارسی
+    text = apply_rtl_marks(text)
 
     payload = {
         "chat_id": CHAT_ID,
@@ -713,7 +678,7 @@ def scrape_site_articles(html_text: str, base_url: str) -> List[Dict[str, Any]]:
     return entries[:POSTS_PER_FEED]
 
 # ============================================================
-# FEED FETCH — با تشخیص HTML + محدود کردن هوشمند
+# FEED FETCH
 # ============================================================
 
 ARTICLE_SELECTORS = [
@@ -722,7 +687,6 @@ ARTICLE_SELECTORS = [
 ]
 STRIP_TAGS = ["script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside"]
 
-# ✅ filter_entries_by_date با پارامتر max_undated
 def filter_entries_by_date(entries: List[Any], max_undated: int = MAX_UNDATED_ENTRIES_PER_FEED) -> List[Any]:
     dated = []
     undated = []
@@ -767,14 +731,11 @@ def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
         new_lm = response.headers.get("Last-Modified")
         etags[url] = {"etag": new_etag, "last_modified": new_lm, "last_fetch": time.time()}
 
-    # ✅ تشخیص HTML vs XML
     ct = response.headers.get("content-type", "").lower()
     is_html = "text/html" in ct or "application/xhtml" in ct
 
     parsed_feed = feedparser.parse(response.content)
     if parsed_feed.entries:
-        # ✅ برای HTML feeds → max_undated = 1 (Digital Whisper fix)
-        # برای XML/RSS feeds → max_undated = 3
         max_undated = MAX_UNDATED_ENTRIES_HTML_FEED if is_html else MAX_UNDATED_ENTRIES_PER_FEED
         entries = filter_entries_by_date(parsed_feed.entries[:POSTS_PER_FEED], max_undated)
         logger.info("  [FEED] ✅ feedparser: %d entries (%s): %s",
@@ -801,7 +762,6 @@ def try_fetch_feed_url(url: str, etags: Dict) -> Tuple[List[Any], bool]:
 
     scraped = scrape_site_articles(response.text, url)
     if scraped:
-        # ✅ scraped articles همیشه بدون تاریخ → max_undated = 1
         entries = filter_entries_by_date(scraped[:POSTS_PER_FEED],
                                          MAX_UNDATED_ENTRIES_HTML_FEED)
         return entries, True
@@ -913,8 +873,6 @@ def get_entry_id(entry: Any) -> Optional[str]:
 def is_recent(entry: Any, max_age_days: int = MAX_AGE_DAYS) -> bool:
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if not parsed:
-        # ✅ بدون تاریخ → True (پردازش می‌شود)
-        # ایمنی: MAX_UNDATED (1-3 per feed) + seen dict (50000 = ~10 روز)
         return True
     try:
         date = datetime(*parsed[:6], tzinfo=timezone.utc)
@@ -1040,6 +998,8 @@ def filter_article(title: str, summary: str, source: str) -> Optional[bool]:
             decision = parse_filter_result(result)
             if decision is None:
                 raise RuntimeError(f"Invalid filter output: {result[:200]}")
+            # ✅ ثبت موفقیت مدل
+            record_model_usage(key)
             logger.info("  [FILTER] %s -> %s", key, "RELEVANT" if decision else "REJECT")
             return decision
         except Exception as e:
@@ -1188,6 +1148,8 @@ def deep_analyze(title: str, article_text: str, link: str, source: str) -> Optio
             title_fa, analysis = parse_analysis_response(result)
             if not analysis:
                 analysis = result
+            # ✅ ثبت موفقیت مدل
+            record_model_usage(key)
             logger.info("  [ANALYSIS] success: %s | title_fa: %s", key, title_fa[:60] if title_fa else "(none)")
             return (title_fa, analysis)
         except Exception as e:
@@ -1262,7 +1224,8 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
     title_fa, analysis = result
     final_title = title_fa if title_fa else title
 
-    success = send_telegram(title=final_title, analysis=analysis, link=link, category="اخبار منتخب", source=source)
+    # ✅ بدون category — [اخبار منتخب] حذف شد
+    success = send_telegram(title=final_title, analysis=analysis, link=link, source=source)
     if not success:
         logger.info("  [RESULT] Telegram failed.")
         return {"status": "retry"}
@@ -1274,8 +1237,13 @@ def process_entry(entry: Any, index: int, total: int) -> Dict[str, str]:
 
 def main() -> None:
     start = time.time()
+
+    # ✅ Reset آمار مدل‌ها برای این run
+    model_usage.clear()
+    models_cooldown_run.clear()
+
     logger.info("=" * 70)
-    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v9)")
+    logger.info("RSS SECURITY NEWS BOT (FINAL EDITION v10)")
     logger.info("=" * 70)
     logger.info("BOT_TOKEN: %s", "OK" if BOT_TOKEN else "MISSING")
     logger.info("GROQ_API_KEY: %s", "OK" if GROQ_API_KEY else "MISSING")
@@ -1452,9 +1420,14 @@ def main() -> None:
 
     logger.info("=" * 70)
     logger.info("Finished in %ss | Sent: %d | Rejected: %d | Failed: %d", elapsed, sent, rejected, failed)
-    logger.info("Deferred: %d | Cooldown: %d | State: %d IDs | %d etags",
-                len(deferred), len(cooling), len(seen), len(etags))
+    logger.info("Model usage: %s", model_usage)
+    logger.info("Cooldown models (this run): %s", models_cooldown_run)
+    logger.info("Deferred: %d | State: %d IDs | %d etags", len(deferred), len(seen), len(etags))
     logger.info("=" * 70)
+
+    # ✅ آمار مدل‌ها برای پیام پایان
+    usage_lines = "\n".join(f"  • {k} ({v}x)" for k, v in model_usage.items()) if model_usage else "  None"
+    cooldown_lines = "\n".join(f"  • {k}" for k in sorted(models_cooldown_run)) if models_cooldown_run else "  None"
 
     finish_msg = (
         f"✅ *پایان*\n\n"
@@ -1462,8 +1435,9 @@ def main() -> None:
         f"▫️ بررسی‌شده: {total}\n"
         f"▫️ ارسال: {sent}\n"
         f"▫️ رد: {rejected}\n"
-        f"▫️ ناموفق: {failed}\n"
-        f"▫️ State: {len(seen)} IDs | {len(etags)} etags"
+        f"▫️ ناموفق: {failed}\n\n"
+        f"🤖 *مدل‌های AI استفاده‌شده:*\n{usage_lines}\n\n"
+        f"❄️ *مدل‌های cooldown:*\n{cooldown_lines}"
     )
     send_status_message(finish_msg, sync_delete=True)
 
