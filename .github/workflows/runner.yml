@@ -3,7 +3,7 @@ name: RSS Aggregator Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"    # هر ۱ ساعت
+    - cron: "*/20 * * * *"    # هر ۲۰ دقیقه
 
 concurrency:
   group: rss-aggregator-bot
